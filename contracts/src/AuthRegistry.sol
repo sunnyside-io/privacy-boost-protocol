@@ -17,16 +17,10 @@
 pragma solidity 0.8.34;
 
 import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
-import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import {Poseidon2T4} from "src/hash/Poseidon2T4.sol";
-import {
-    DOMAIN_ACCOUNTID,
-    DOMAIN_REG_LEAF,
-    DOMAIN_REG_NODE,
-    ROOT_HISTORY_SIZE,
-    AUTH_ZERO_ROOT
-} from "src/interfaces/Constants.sol";
+import {DOMAIN_ACCOUNTID, DOMAIN_REG_LEAF, DOMAIN_REG_NODE, ROOT_HISTORY_SIZE} from "src/interfaces/Constants.sol";
 import "src/interfaces/Constants.sol" as ContractConstants;
 import {LibAuthZeroHashes} from "src/lib/LibAuthZeroHashes.sol";
 import {EcdsaSig, AuthKeyInfo, AccountInfo, AuthTreeState} from "src/interfaces/IStructs.sol";
@@ -47,6 +41,14 @@ contract AuthRegistry is IAuthRegistry, Ownable2StepUpgradeable {
     );
     bytes32 private constant REVOKE_TYPEHASH =
         keccak256("Revoke(uint256 accountId,uint256 authPkX,uint64 expiry,uint256 nonce)");
+
+    /// @dev Solady implicit-mode ERC-7739 contents description
+    ///      supported by _verifyOwnerSig's fallback appendix parser.
+    ///      ERC-7739 encodes the contentsDescription bytes followed by their
+    ///      uint16 length; this contract intentionally only supports the
+    ///      implicit `Contents(bytes32 stuff)` description shape.
+    bytes32 private constant CONTENTS_DESCRIPTION_HASH = keccak256("Contents(bytes32 stuff)");
+    uint256 private constant CONTENTS_DESCRIPTION_LENGTH = 23;
 
     /// @notice Maximum number of auth trees supported (tree numbers are 0..MAX_AUTH_TREE_NUMBER-1)
     uint16 public constant MAX_AUTH_TREE_NUMBER = ContractConstants.MAX_AUTH_TREE_NUMBER;
@@ -123,10 +125,23 @@ contract AuthRegistry is IAuthRegistry, Ownable2StepUpgradeable {
         uint256 authPkY,
         uint64 expiry,
         address expectedOwner,
-        EcdsaSig calldata sig
+        bytes calldata sig
     ) external {
         uint256 accountId = computeAccountId(expectedOwner, salt);
         _registerAccount(accountId, authPkX, authPkY, expiry, expectedOwner, sig);
+    }
+
+    /// @inheritdoc IAuthRegistry
+    function register(
+        uint256 salt,
+        uint256 authPkX,
+        uint256 authPkY,
+        uint64 expiry,
+        address expectedOwner,
+        EcdsaSig calldata sig
+    ) external {
+        uint256 accountId = computeAccountId(expectedOwner, salt);
+        _registerAccount(accountId, authPkX, authPkY, expiry, expectedOwner, _packLegacySig(sig));
     }
 
     /// @inheritdoc IAuthRegistry
@@ -140,7 +155,7 @@ contract AuthRegistry is IAuthRegistry, Ownable2StepUpgradeable {
         uint256 authPkY,
         uint64 expiry,
         address expectedOwner,
-        EcdsaSig calldata sig
+        bytes memory sig
     ) internal {
         if (msg.sender != expectedOwner && !allowedRelays[msg.sender]) revert NotAuthorized();
         if (accountId == 0) revert InvalidAccountId();
@@ -152,8 +167,8 @@ contract AuthRegistry is IAuthRegistry, Ownable2StepUpgradeable {
 
         AccountInfo storage account = _accountInfo[accountId];
         uint96 nonce = account.nonce;
-        address recovered = _recoverRegister(accountId, authPkX, authPkY, expiry, nonce, sig);
-        if (recovered != expectedOwner) revert InvalidSignature();
+        bytes32 structHash = _registerStructHash(accountId, authPkX, authPkY, expiry, nonce);
+        _verifyOwnerSig(expectedOwner, structHash, sig);
 
         address existingOwner = account.owner;
         if (existingOwner != address(0)) {
@@ -204,8 +219,31 @@ contract AuthRegistry is IAuthRegistry, Ownable2StepUpgradeable {
         uint256 newAuthPkX,
         uint256 newAuthPkY,
         uint64 newExpiry,
+        bytes calldata sig
+    ) external {
+        _rotate(accountId, oldAuthPkX, newAuthPkX, newAuthPkY, newExpiry, sig);
+    }
+
+    /// @inheritdoc IAuthRegistry
+    function rotate(
+        uint256 accountId,
+        uint256 oldAuthPkX,
+        uint256 newAuthPkX,
+        uint256 newAuthPkY,
+        uint64 newExpiry,
         EcdsaSig calldata sig
     ) external {
+        _rotate(accountId, oldAuthPkX, newAuthPkX, newAuthPkY, newExpiry, _packLegacySig(sig));
+    }
+
+    function _rotate(
+        uint256 accountId,
+        uint256 oldAuthPkX,
+        uint256 newAuthPkX,
+        uint256 newAuthPkY,
+        uint64 newExpiry,
+        bytes memory sig
+    ) internal {
         AccountInfo storage account = _accountInfo[accountId];
         address accountOwner = account.owner;
         if (accountOwner == address(0)) revert NotRegistered();
@@ -220,8 +258,8 @@ contract AuthRegistry is IAuthRegistry, Ownable2StepUpgradeable {
         if (oldInfo.revoked) revert AuthKeyAlreadyRevoked();
 
         uint96 nonce = account.nonce;
-        address signer = _recoverRotate(accountId, oldAuthPkX, newAuthPkX, newAuthPkY, newExpiry, nonce, sig);
-        if (signer != accountOwner) revert InvalidSignature();
+        bytes32 structHash = _rotateStructHash(accountId, oldAuthPkX, newAuthPkX, newAuthPkY, newExpiry, nonce);
+        _verifyOwnerSig(accountOwner, structHash, sig);
         if (!LibBabyJubJub.isValidPublicKey(newAuthPkX, newAuthPkY)) revert InvalidAuthPublicKey();
 
         account.nonce = nonce + 1;
@@ -246,7 +284,16 @@ contract AuthRegistry is IAuthRegistry, Ownable2StepUpgradeable {
     }
 
     /// @inheritdoc IAuthRegistry
+    function revoke(uint256 accountId, uint256 authPkX, uint64 expiry, bytes calldata sig) external {
+        _revoke(accountId, authPkX, expiry, sig);
+    }
+
+    /// @inheritdoc IAuthRegistry
     function revoke(uint256 accountId, uint256 authPkX, uint64 expiry, EcdsaSig calldata sig) external {
+        _revoke(accountId, authPkX, expiry, _packLegacySig(sig));
+    }
+
+    function _revoke(uint256 accountId, uint256 authPkX, uint64 expiry, bytes memory sig) internal {
         AccountInfo storage account = _accountInfo[accountId];
         address accountOwner = account.owner;
         if (accountOwner == address(0)) revert NotRegistered();
@@ -259,8 +306,8 @@ contract AuthRegistry is IAuthRegistry, Ownable2StepUpgradeable {
         if (info.revoked) revert AuthKeyAlreadyRevoked();
 
         uint96 nonce = account.nonce;
-        address signer = _recoverRevoke(accountId, authPkX, expiry, nonce, sig);
-        if (signer != accountOwner) revert InvalidSignature();
+        bytes32 structHash = _revokeStructHash(accountId, authPkX, expiry, nonce);
+        _verifyOwnerSig(accountOwner, structHash, sig);
 
         account.nonce = nonce + 1;
         info.revoked = true;
@@ -268,6 +315,90 @@ contract AuthRegistry is IAuthRegistry, Ownable2StepUpgradeable {
         _updateLeaf(info.treeNumber, info.treeIndex, 0);
 
         emit AuthKeyRevoked(accountId, authKeyId, info.treeIndex);
+    }
+
+    function _packLegacySig(EcdsaSig calldata sig) internal pure returns (bytes memory) {
+        return abi.encodePacked(sig.r, sig.s, sig.v);
+    }
+
+    /// @dev Verifies `sig` against `expectedOwner` for the action whose
+    ///      EIP-712 struct hash is `structHash`. Routes EOAs and EIP-1271
+    ///      smart-contract wallets through OZ's SignatureChecker on the raw
+    ///      dapp digest first; only on failure attempts an ERC-7739
+    ///      ("defensive rehashing") rewrap for wallets that decline raw and
+    ///      require a Solady-style ERC-7739 generic-wrap digest.
+    ///
+    ///      Raw-first matters for compatibility:
+    ///        - EOAs (recover on raw EIP-712 digest).
+    ///        - Standard ERC-1271 wallets that accept the raw dapp digest.
+    ///        - 7739-aware wallets that also accept the raw digest fall here.
+    ///      A wallet that strictly requires the wrapped digest fails the raw
+    ///      check and is served by the fallback.
+    ///
+    ///      The fallback path is gated on independent checks. Failing any one
+    ///      reverts with a granular ERC-7739 diagnostic — mismatch is
+    ///      rejection, not soft-pass:
+    ///
+    ///        1. `expectedOwner.code.length > 0` — EOAs cannot verify an
+    ///           appendix sig through ecrecover, so there is no fallback
+    ///           path for them and we revert immediately.
+    ///        2. `appSep == _domainSeparator()` — cross-app sig replay
+    ///           defense.
+    ///        3. The appendix contentsDescription is exactly the 23-byte
+    ///           Solady implicit-mode
+    ///           `Contents(bytes32 stuff)` description; explicit-mode and
+    ///           other description shapes are outside the path this validator
+    ///           supports.
+    ///        4. `contentsHash` binds to THIS action as one of the two
+    ///           deployed wallet shapes we intentionally support:
+    ///             - `rawDigest`: the appendix contentsHash is the dapp's
+    ///               full EIP-712 digest.
+    ///             - `keccak256(CONTENTS_DESCRIPTION_HASH, structHash)`: the
+    ///               appendix contentsHash is the Solady-style
+    ///               `Contents(bytes32 stuff)` hashStruct.
+    ///           In the rawDigest shape, the AuthRegistry domain is part of
+    ///           contentsHash. In the hashStruct shape, the domain is bound by
+    ///           the separate appSep check and the final wrapped digest. Both
+    ///           accepted paths bind the signature to this AuthRegistry domain
+    ///           and the action struct fields, including nonce. Without this
+    ///           binding, any 7739 sig the user ever produced against our
+    ///           domain would replay across register / rotate / revoke and
+    ///           across any (accountId, authPk*, expiry, nonce) tuple.
+    function _verifyOwnerSig(address expectedOwner, bytes32 structHash, bytes memory sig) internal view {
+        bytes32 domainSep = _domainSeparator();
+        bytes32 rawDigest = MessageHashUtils.toTypedDataHash(domainSep, structHash);
+
+        if (SignatureChecker.isValidSignatureNow(expectedOwner, rawDigest, sig)) {
+            return;
+        }
+        if (expectedOwner.code.length == 0) revert InvalidSignature();
+
+        uint256 sigLen = sig.length;
+        if (sigLen < 2) revert InvalidSignatureLength();
+        uint256 n;
+        unchecked {
+            n = (uint256(uint8(sig[sigLen - 2])) << 8) | uint256(uint8(sig[sigLen - 1]));
+        }
+        if (n != CONTENTS_DESCRIPTION_LENGTH || sigLen <= 66 + n) revert InvalidSignatureLength();
+
+        uint256 appStart = sigLen - 66 - n;
+        bytes32 appSep;
+        bytes32 contentsHash;
+        bytes32 contentsDescriptionHash;
+        assembly {
+            appSep := mload(add(add(sig, 0x20), appStart))
+            contentsHash := mload(add(add(sig, 0x20), add(appStart, 32)))
+            contentsDescriptionHash := keccak256(add(add(sig, 0x20), add(appStart, 64)), n)
+        }
+        if (appSep != domainSep) revert InvalidERC7739AppDomain();
+        if (contentsDescriptionHash != CONTENTS_DESCRIPTION_HASH) revert InvalidERC7739ContentsDescription();
+        bytes32 placeholderContentsHash = keccak256(abi.encode(CONTENTS_DESCRIPTION_HASH, structHash));
+        if (contentsHash != rawDigest && contentsHash != placeholderContentsHash) revert InvalidERC7739ContentsHash();
+
+        bytes32 wrappedDigest = keccak256(abi.encodePacked(hex"1901", appSep, contentsHash));
+        if (!SignatureChecker.isValidSignatureNow(expectedOwner, wrappedDigest, sig)) {
+            revert InvalidERC7739WrappedSignature();
+        }
     }
 
     /// @inheritdoc IAuthRegistry
@@ -328,43 +459,31 @@ contract AuthRegistry is IAuthRegistry, Ownable2StepUpgradeable {
         return keccak256(abi.encode(DOMAIN_TYPEHASH, NAME_HASH, VERSION_HASH, block.chainid, address(this)));
     }
 
-    function _recoverRegister(
-        uint256 accountId,
-        uint256 authPkX,
-        uint256 authPkY,
-        uint64 expiry,
-        uint256 nonce,
-        EcdsaSig calldata sig
-    ) internal view returns (address) {
-        bytes32 structHash = keccak256(abi.encode(REGISTER_TYPEHASH, accountId, authPkX, authPkY, expiry, nonce));
-        bytes32 digest = MessageHashUtils.toTypedDataHash(_domainSeparator(), structHash);
-        return ECDSA.recover(digest, abi.encodePacked(sig.r, sig.s, sig.v));
+    function _registerStructHash(uint256 accountId, uint256 authPkX, uint256 authPkY, uint64 expiry, uint256 nonce)
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(REGISTER_TYPEHASH, accountId, authPkX, authPkY, expiry, nonce));
     }
 
-    function _recoverRotate(
+    function _rotateStructHash(
         uint256 accountId,
         uint256 oldAuthPkX,
         uint256 authPkX,
         uint256 authPkY,
         uint64 expiry,
-        uint256 nonce,
-        EcdsaSig calldata sig
-    ) internal view returns (address) {
-        bytes32 structHash = keccak256(
-            abi.encode(ROTATE_TYPEHASH, accountId, oldAuthPkX, authPkX, authPkY, expiry, nonce)
-        );
-        bytes32 digest = MessageHashUtils.toTypedDataHash(_domainSeparator(), structHash);
-        return ECDSA.recover(digest, abi.encodePacked(sig.r, sig.s, sig.v));
+        uint256 nonce
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encode(ROTATE_TYPEHASH, accountId, oldAuthPkX, authPkX, authPkY, expiry, nonce));
     }
 
-    function _recoverRevoke(uint256 accountId, uint256 authPkX, uint64 expiry, uint256 nonce, EcdsaSig calldata sig)
+    function _revokeStructHash(uint256 accountId, uint256 authPkX, uint64 expiry, uint256 nonce)
         internal
-        view
-        returns (address)
+        pure
+        returns (bytes32)
     {
-        bytes32 structHash = keccak256(abi.encode(REVOKE_TYPEHASH, accountId, authPkX, expiry, nonce));
-        bytes32 digest = MessageHashUtils.toTypedDataHash(_domainSeparator(), structHash);
-        return ECDSA.recover(digest, abi.encodePacked(sig.r, sig.s, sig.v));
+        return keccak256(abi.encode(REVOKE_TYPEHASH, accountId, authPkX, expiry, nonce));
     }
 
     /// @inheritdoc IAuthRegistry

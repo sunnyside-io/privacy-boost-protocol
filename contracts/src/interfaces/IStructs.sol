@@ -23,6 +23,13 @@ struct TokenInfo {
     uint256 tokenSubId;
 }
 
+/// @notice Legacy 65-byte ECDSA signature tuple.
+struct EcdsaSig {
+    uint8 v;
+    bytes32 r;
+    bytes32 s;
+}
+
 /// @notice Per-output published metadata (calldata ABI shape)
 /// Encrypted payload: senderAccountId(32) + recipientAccountId(32) + tokenId(2) + amount(12) + noteRnd(16) = 94B
 /// AES-256-GCM output: 110B = ciphertext(94B) || tag(16B)
@@ -57,13 +64,6 @@ struct Withdrawal {
     address to;
     uint16 tokenId;
     uint96 amount;
-}
-
-/// @notice ECDSA signature container
-struct EcdsaSig {
-    uint8 v;
-    bytes32 r;
-    bytes32 s;
 }
 
 /// @notice Pending deposit request for 2-step deposit
@@ -146,7 +146,7 @@ struct AuthKeyInfo {
 
 /// @notice Packed account info for storage efficiency (owner + nonce in single slot)
 struct AccountInfo {
-    address owner; // 20 bytes: account owner EOA
+    address owner; // 20 bytes: account owner
     uint96 nonce; // 12 bytes: replay protection nonce (2^96 is sufficient)
 }
 
