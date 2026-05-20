@@ -21,6 +21,21 @@ import {TransparentUpgradeableProxy} from "@openzeppelin/contracts/proxy/transpa
 import {AuthRegistry} from "src/AuthRegistry.sol";
 import {IAuthRegistry} from "src/interfaces/IAuthRegistry.sol";
 import {EcdsaSig} from "src/interfaces/IStructs.sol";
+import {MockERC7739Account} from "test/mocks/MockERC7739Account.sol";
+
+contract ERC1271WalletMock {
+    bytes4 internal constant MAGIC_VALUE = 0x1626ba7e;
+
+    mapping(bytes32 hash => mapping(bytes32 signatureHash => bool approved)) internal approvedSignatures;
+
+    function approveSignature(bytes32 hash, bytes calldata signature) external {
+        approvedSignatures[hash][keccak256(signature)] = true;
+    }
+
+    function isValidSignature(bytes32 hash, bytes memory signature) external view returns (bytes4) {
+        return approvedSignatures[hash][keccak256(signature)] ? MAGIC_VALUE : bytes4(0xffffffff);
+    }
+}
 
 /// @notice Unit tests for AuthRegistry multi-tree support with nonce-based signatures
 contract AuthRegistryTest is Test {
@@ -85,11 +100,20 @@ contract AuthRegistryTest is Test {
         uint256 authPkY,
         uint64 expiry,
         uint256 nonce
-    ) internal view returns (EcdsaSig memory) {
+    ) internal view returns (bytes memory) {
         bytes32 structHash = keccak256(abi.encode(REGISTER_TYPEHASH, accountId, authPkX, authPkY, expiry, nonce));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
-        return EcdsaSig({v: v, r: r, s: s});
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _registerDigest(uint256 accountId, uint256 authPkX, uint256 authPkY, uint64 expiry, uint256 nonce)
+        internal
+        view
+        returns (bytes32)
+    {
+        bytes32 structHash = keccak256(abi.encode(REGISTER_TYPEHASH, accountId, authPkX, authPkY, expiry, nonce));
+        return keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
     }
 
     function _signRotate(
@@ -100,23 +124,59 @@ contract AuthRegistryTest is Test {
         uint256 authPkY,
         uint64 expiry,
         uint256 nonce
-    ) internal view returns (EcdsaSig memory) {
+    ) internal view returns (bytes memory) {
         bytes32 structHash = keccak256(
             abi.encode(ROTATE_TYPEHASH, accountId, oldAuthPkX, authPkX, authPkY, expiry, nonce)
         );
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
-        return EcdsaSig({v: v, r: r, s: s});
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _rotateDigest(
+        uint256 accountId,
+        uint256 oldAuthPkX,
+        uint256 authPkX,
+        uint256 authPkY,
+        uint64 expiry,
+        uint256 nonce
+    ) internal view returns (bytes32) {
+        bytes32 structHash = keccak256(
+            abi.encode(ROTATE_TYPEHASH, accountId, oldAuthPkX, authPkX, authPkY, expiry, nonce)
+        );
+        return keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
     }
 
     function _signRevoke(uint256 privateKey, uint256 accountId, uint256 authPkX, uint64 expiry, uint256 nonce)
         internal
         view
-        returns (EcdsaSig memory)
+        returns (bytes memory)
     {
         bytes32 structHash = keccak256(abi.encode(REVOKE_TYPEHASH, accountId, authPkX, expiry, nonce));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _revokeDigest(uint256 accountId, uint256 authPkX, uint64 expiry, uint256 nonce)
+        internal
+        view
+        returns (bytes32)
+    {
+        bytes32 structHash = keccak256(abi.encode(REVOKE_TYPEHASH, accountId, authPkX, expiry, nonce));
+        return keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
+    }
+
+    function _legacySig(bytes memory sig) internal pure returns (EcdsaSig memory) {
+        require(sig.length == 65, "bad sig len");
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := mload(add(sig, 32))
+            s := mload(add(sig, 64))
+            v := byte(0, mload(add(sig, 96)))
+        }
         return EcdsaSig({v: v, r: r, s: s});
     }
 
@@ -152,7 +212,7 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
         uint256 nonce = registry.nonces(accountId);
 
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, authPkX, authPkY, expiry, nonce);
+        bytes memory sig = _signRegister(privateKey, accountId, authPkX, authPkY, expiry, nonce);
 
         vm.expectEmit(true, true, true, true);
         emit IAuthRegistry.Registered(accountId, signer, 0, authPkX, authPkY, expiry);
@@ -169,6 +229,23 @@ contract AuthRegistryTest is Test {
         assertEq(registry.getAuthKeys(accountId).length, 1, "Should have 1 auth key");
     }
 
+    function test_register_legacyEcdsaSigTuple_success() public {
+        uint256 privateKey = 0x1234;
+        address signer = vm.addr(privateKey);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(signer, salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+
+        vm.prank(signer);
+        registry.register(salt, PK1X, PK1Y, expiry, signer, _legacySig(sig));
+
+        assertEq(registry.ownerOf(accountId), signer, "Owner should be signer");
+        assertEq(registry.nonces(accountId), 1, "Nonce should be incremented");
+    }
+
     function test_register_multipleAccounts() public {
         for (uint256 i = 1; i <= 5; i++) {
             uint256 privateKey = i;
@@ -179,7 +256,7 @@ contract AuthRegistryTest is Test {
             uint64 expiry = uint64(block.timestamp + 1 hours);
             uint256 nonce = registry.nonces(accountId);
 
-            EcdsaSig memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, nonce);
+            bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, nonce);
             vm.prank(signer);
             registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
 
@@ -198,12 +275,12 @@ contract AuthRegistryTest is Test {
         uint256 accountId = registry.computeAccountId(signer, salt);
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
 
         // Try to register same authPkX again (different authPkY doesn't matter - authKeyId is based on authPkX)
-        EcdsaSig memory sig2 = _signRegister(privateKey, accountId, PK1X, PK1Y_ALT, expiry, 1);
+        bytes memory sig2 = _signRegister(privateKey, accountId, PK1X, PK1Y_ALT, expiry, 1);
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.AlreadyRegistered.selector);
         registry.register(salt, PK1X, PK1Y_ALT, expiry, signer, sig2);
@@ -217,7 +294,7 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register first auth key
-        EcdsaSig memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
@@ -225,7 +302,7 @@ contract AuthRegistryTest is Test {
         assertEq(registry.getAuthKeys(accountId).length, 1);
 
         // Register second auth key (different authPkX) - should succeed
-        EcdsaSig memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
+        bytes memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
         vm.prank(signer);
         registry.register(salt, PK2X, PK2Y, expiry, signer, sig2);
 
@@ -252,13 +329,13 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register with first owner
-        EcdsaSig memory sig1 = _signRegister(privateKey1, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey1, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer1);
         registry.register(salt, PK1X, PK1Y, expiry, signer1, sig1);
 
         // A different owner derives a different accountId for the same salt, so the signature
         // over signer1's accountId becomes invalid for signer2's registration attempt.
-        EcdsaSig memory sig2 = _signRegister(privateKey2, accountId, PK2X, PK2Y, expiry, 1);
+        bytes memory sig2 = _signRegister(privateKey2, accountId, PK2X, PK2Y, expiry, 1);
         vm.prank(signer2);
         vm.expectRevert(IAuthRegistry.InvalidSignature.selector);
         registry.register(salt, PK2X, PK2Y, expiry, signer2, sig2);
@@ -272,7 +349,7 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Sign with privateKey but call as wrongSigner (msg.sender == expectedOwner, but signature doesn't match)
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
 
         vm.prank(wrongSigner);
         vm.expectRevert(IAuthRegistry.InvalidSignature.selector);
@@ -289,7 +366,7 @@ contract AuthRegistryTest is Test {
         uint256 accountId = registry.computeAccountId(signer, salt);
         uint64 expiry = uint64(block.timestamp - 1); // Expired (999 < 1000)
 
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
 
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.SignatureExpired.selector);
@@ -304,7 +381,7 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
         uint256 wrongNonce = 999; // Wrong nonce
 
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, wrongNonce);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, wrongNonce);
 
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidSignature.selector);
@@ -324,7 +401,7 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // First register
-        EcdsaSig memory regSig = _signRegister(privateKey, accountId, authPkX, authPkY, expiry, 0);
+        bytes memory regSig = _signRegister(privateKey, accountId, authPkX, authPkY, expiry, 0);
         vm.prank(signer);
         registry.register(salt, authPkX, authPkY, expiry, signer, regSig);
 
@@ -335,7 +412,7 @@ contract AuthRegistryTest is Test {
         uint256 newAuthPkY = PK2Y;
         uint64 newExpiry = uint64(block.timestamp + 2 hours);
         uint256 rotateNonce = registry.nonces(accountId); // Should be 1
-        EcdsaSig memory rotSig =
+        bytes memory rotSig =
             _signRotate(privateKey, accountId, authPkX, newAuthPkX, newAuthPkY, newExpiry, rotateNonce);
 
         vm.prank(signer);
@@ -357,6 +434,32 @@ contract AuthRegistryTest is Test {
         assertEq(registry.nonces(accountId), 2);
     }
 
+    function test_rotateAndRevoke_legacyEcdsaSigTuple_success() public {
+        uint256 privateKey = 0x1234;
+        address signer = vm.addr(privateKey);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(signer, salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        vm.prank(signer);
+        registry.register(salt, PK1X, PK1Y, expiry, signer, _legacySig(regSig));
+
+        bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
+        vm.prank(signer);
+        registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, _legacySig(rotSig));
+        assertEq(registry.nonces(accountId), 2, "Nonce should increment after rotate");
+
+        bytes memory revokeSig = _signRevoke(privateKey, accountId, PK2X, expiry, 2);
+        vm.prank(signer);
+        registry.revoke(accountId, PK2X, expiry, _legacySig(revokeSig));
+
+        bytes32 newAuthKeyId = registry.computeAuthKeyId(accountId, PK2X);
+        assertEq(registry.authKeyRevoked(newAuthKeyId), true, "Rotated key should be revoked");
+        assertEq(registry.nonces(accountId), 3, "Nonce should increment after revoke");
+    }
+
     function test_rotate_notRegistered_reverts() public {
         address relay = address(0xBEEF);
         uint256 privateKey = 0x1234;
@@ -369,7 +472,7 @@ contract AuthRegistryTest is Test {
         vm.prank(operator);
         registry.setAllowedRelays(relays, true);
 
-        EcdsaSig memory sig = _signRotate(privateKey, accountId, 111, PK1X, PK1Y, expiry, 0);
+        bytes memory sig = _signRotate(privateKey, accountId, 111, PK1X, PK1Y, expiry, 0);
 
         vm.prank(relay);
         vm.expectRevert(IAuthRegistry.NotRegistered.selector);
@@ -384,12 +487,12 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register one auth key
-        EcdsaSig memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         // Try to rotate non-existent auth key
-        EcdsaSig memory rotSig = _signRotate(privateKey, accountId, 999, 666, 777, expiry, 1);
+        bytes memory rotSig = _signRotate(privateKey, accountId, 999, 666, 777, expiry, 1);
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.AuthKeyNotFound.selector);
         registry.rotate(accountId, 999, 666, 777, expiry, rotSig); // oldAuthPkX = 999 doesn't exist
@@ -403,16 +506,16 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register two auth keys: 222 and 444
-        EcdsaSig memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
-        EcdsaSig memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
+        bytes memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
         vm.prank(signer);
         registry.register(salt, PK2X, PK2Y, expiry, signer, sig2);
 
         // Try to rotate auth key 222 → 444 (444 already exists)
-        EcdsaSig memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 2);
+        bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 2);
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.AlreadyRegistered.selector);
         registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, rotSig);
@@ -428,12 +531,12 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register with privateKey
-        EcdsaSig memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         // Try to rotate with wrongPrivateKey (but calling as correct owner)
-        EcdsaSig memory rotSig = _signRotate(wrongPrivateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
+        bytes memory rotSig = _signRotate(wrongPrivateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
 
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidSignature.selector);
@@ -451,13 +554,13 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register
-        EcdsaSig memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         // Try to rotate with expired signature
         uint64 expiredExpiry = uint64(block.timestamp - 1); // 999 < 1000
-        EcdsaSig memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiredExpiry, 1);
+        bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiredExpiry, 1);
 
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.SignatureExpired.selector);
@@ -472,12 +575,12 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register
-        EcdsaSig memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         // Rotate once
-        EcdsaSig memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
+        bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
         vm.prank(signer);
         registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, rotSig);
 
@@ -495,16 +598,16 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register two auth keys: 222 and 444
-        EcdsaSig memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
-        EcdsaSig memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
+        bytes memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
         vm.prank(signer);
         registry.register(salt, PK2X, PK2Y, expiry, signer, sig2);
 
         // Sign rotate for key 222 → 666 (oldAuthPkX = 222)
-        EcdsaSig memory rotSig = _signRotate(privateKey, accountId, PK1X, 666, 777, expiry, 2);
+        bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, 666, 777, expiry, 2);
 
         // Try to use same signature to rotate key 444 → 666 (oldAuthPkX = 444)
         // This should fail because the signature binds oldAuthPkX = 222
@@ -530,7 +633,7 @@ contract AuthRegistryTest is Test {
 
         uint256 rootBefore = registry.authTreeRoot(0);
 
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
 
@@ -570,7 +673,7 @@ contract AuthRegistryTest is Test {
         uint256 accountId = registry.computeAccountId(signer, salt);
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
 
         // Expect RootUpdated event with treeNumber = 0
         vm.expectEmit(true, false, false, false);
@@ -591,7 +694,7 @@ contract AuthRegistryTest is Test {
         uint256 accountId = registry.computeAccountId(signer, salt);
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
 
@@ -611,7 +714,7 @@ contract AuthRegistryTest is Test {
             uint256 accountId = registry.computeAccountId(signer, salt);
             uint256 nonce = registry.nonces(accountId);
 
-            EcdsaSig memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, nonce);
+            bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, nonce);
             vm.prank(signer);
             registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
 
@@ -632,19 +735,19 @@ contract AuthRegistryTest is Test {
         assertEq(registry.nonces(accountId), 0);
 
         // Register increments nonce
-        EcdsaSig memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
         assertEq(registry.nonces(accountId), 1);
 
         // Rotate increments nonce
-        EcdsaSig memory rotSig1 = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
+        bytes memory rotSig1 = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
         vm.prank(signer);
         registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, rotSig1);
         assertEq(registry.nonces(accountId), 2);
 
         // Another rotate increments nonce again
-        EcdsaSig memory rotSig2 = _signRotate(privateKey, accountId, PK2X, PK3X, PK3Y, expiry, 2);
+        bytes memory rotSig2 = _signRotate(privateKey, accountId, PK2X, PK3X, PK3Y, expiry, 2);
         vm.prank(signer);
         registry.rotate(accountId, PK2X, PK3X, PK3Y, expiry, rotSig2);
         assertEq(registry.nonces(accountId), 3);
@@ -660,19 +763,19 @@ contract AuthRegistryTest is Test {
         assertEq(registry.nonces(accountId), 0);
 
         // Register first auth key (nonce 0)
-        EcdsaSig memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
         assertEq(registry.nonces(accountId), 1);
 
         // Register second auth key (nonce 1)
-        EcdsaSig memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
+        bytes memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
         vm.prank(signer);
         registry.register(salt, PK2X, PK2Y, expiry, signer, sig2);
         assertEq(registry.nonces(accountId), 2);
 
         // Rotate first auth key (nonce 2)
-        EcdsaSig memory rotSig = _signRotate(privateKey, accountId, PK1X, PK3X, PK3Y, expiry, 2);
+        bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK3X, PK3Y, expiry, 2);
         vm.prank(signer);
         registry.rotate(accountId, PK1X, PK3X, PK3Y, expiry, rotSig);
         assertEq(registry.nonces(accountId), 3);
@@ -690,7 +793,7 @@ contract AuthRegistryTest is Test {
         uint256 authPkY = PK1Y;
         uint64 expiry = uint64(block.timestamp + 1 days);
 
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, authPkX, authPkY, expiry, 0);
+        bytes memory sig = _signRegister(privateKey, accountId, authPkX, authPkY, expiry, 0);
         vm.prank(signer);
         registry.register(salt, authPkX, authPkY, expiry, signer, sig);
 
@@ -707,7 +810,7 @@ contract AuthRegistryTest is Test {
         uint256 accountId = registry.computeAccountId(signer, salt);
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
 
         // Try to call register as notAuthorized (not owner and not relay)
         vm.prank(notAuthorized);
@@ -724,12 +827,12 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // First register
-        EcdsaSig memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         // Try to rotate as notAuthorized (not owner and not relay)
-        EcdsaSig memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
+        bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
         vm.prank(notAuthorized);
         vm.expectRevert(IAuthRegistry.NotAuthorized.selector);
         registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, rotSig);
@@ -832,7 +935,7 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
         uint256 nonce = registry.nonces(accountId);
 
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, authPkX, authPkY, expiry, nonce);
+        bytes memory sig = _signRegister(privateKey, accountId, authPkX, authPkY, expiry, nonce);
 
         vm.expectEmit(true, true, true, true);
         emit IAuthRegistry.Registered(accountId, signer, 0, authPkX, authPkY, expiry);
@@ -862,7 +965,7 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // First register (using relay)
-        EcdsaSig memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
@@ -870,7 +973,7 @@ contract AuthRegistryTest is Test {
         uint256 newAuthPkX = PK2X;
         uint256 newAuthPkY = PK2Y;
         uint256 rotateNonce = registry.nonces(accountId);
-        EcdsaSig memory rotSig = _signRotate(privateKey, accountId, PK1X, newAuthPkX, newAuthPkY, expiry, rotateNonce);
+        bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, newAuthPkX, newAuthPkY, expiry, rotateNonce);
 
         vm.prank(relay);
         registry.rotate(accountId, PK1X, newAuthPkX, newAuthPkY, expiry, rotSig);
@@ -895,11 +998,645 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Sign with privateKey but claim wrongSigner as expectedOwner
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
 
         vm.prank(relay);
         vm.expectRevert(IAuthRegistry.InvalidSignature.selector);
         registry.register(salt, PK1X, PK1Y, expiry, wrongSigner, sig);
+    }
+
+    function test_register_eip1271ContractWallet_success() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory sig = hex"1271c0ffee";
+        bytes32 digest = _registerDigest(accountId, PK1X, PK1Y, expiry, 0);
+        wallet.approveSignature(digest, sig);
+
+        vm.prank(relay);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
+
+        bytes32 authKeyId = registry.computeAuthKeyId(accountId, PK1X);
+        assertEq(registry.ownerOf(accountId), address(wallet));
+        assertEq(registry.authKeyTreeOf(authKeyId), 0);
+        assertEq(registry.authKeyIndexOf(authKeyId), 0);
+        assertEq(registry.nonces(accountId), 1);
+    }
+
+    function test_register_eip1271ContractWallet_rejectedSignature_reverts() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory sig = hex"bad01271";
+
+        vm.prank(relay);
+        vm.expectRevert(IAuthRegistry.InvalidSignatureLength.selector);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
+    }
+
+    function test_register_erc7739Appendix_malformedLength_reverts() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory sig = new bytes(131);
+
+        vm.prank(relay);
+        vm.expectRevert(IAuthRegistry.InvalidSignatureLength.selector);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
+    }
+
+    /// @dev keccak256("Contents(bytes32 stuff)") duplicated from
+    ///      AuthRegistry.CONTENTS_DESCRIPTION_HASH (private constant). If the
+    ///      supported appendix description ever changes, this must move in
+    ///      lockstep.
+    bytes32 private constant CONTENTS_DESCRIPTION_HASH = keccak256("Contents(bytes32 stuff)");
+    bytes32 private constant MOCK_ERC7739_TYPED_DATA_SIGN_TYPEHASH = keccak256(
+        "TypedDataSign(Contents contents,string name,string version,uint256 chainId,address verifyingContract)Contents(bytes32 stuff)"
+    );
+
+    /// @dev Builds an ERC-7739 TypedDataSign appendix shaped like the ones
+    ///      Solady-derived validators (Startale's StartaleSmartAccount, etc.)
+    ///      emit when the wallet wraps dapp typed data into a generic
+    ///      `Contents(bytes32 stuff)` placeholder rather than introspecting
+    ///      it. Inner sig content is opaque — our mock approves by hash, not
+    ///      by sig validity.
+    function _buildErc7739Sig(bytes32 appSep, bytes32 contentsHash) internal pure returns (bytes memory) {
+        return _buildErc7739SigWithDescription(appSep, contentsHash, "Contents(bytes32 stuff)");
+    }
+
+    function _buildErc7739SigWithInner(bytes memory inner, bytes32 appSep, bytes32 contentsHash)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodePacked(inner, appSep, contentsHash, bytes("Contents(bytes32 stuff)"), uint16(23));
+    }
+
+    function _buildErc7739SigWithoutInner(bytes32 appSep, bytes32 contentsHash) internal pure returns (bytes memory) {
+        return abi.encodePacked(appSep, contentsHash, bytes("Contents(bytes32 stuff)"), uint16(23));
+    }
+
+    /// @dev Variant that allows overriding the contentsDescription byte
+    ///      string. Layout is identical; only the description bytes and the
+    ///      trailing uint16 length
+    ///      differ.
+    function _buildErc7739SigWithDescription(bytes32 appSep, bytes32 contentsHash, bytes memory contentsDescription)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        bytes memory inner = new bytes(65); // any opaque 65-byte inner sig
+        return abi.encodePacked(inner, appSep, contentsHash, contentsDescription, uint16(contentsDescription.length));
+    }
+
+    /// @dev Computes the Solady accepted contentsHash shape for the rewrap path:
+    ///      Solady's generic wrap places the dapp's struct hash into
+    ///      `Contents{stuff: dappStructHash}` and hashStructs that.
+    function _erc7739BoundContentsHash(bytes32 dappStructHash) internal pure returns (bytes32) {
+        return keccak256(abi.encode(CONTENTS_DESCRIPTION_HASH, dappStructHash));
+    }
+
+    function _mockERC7739WalletDigest(address wallet, bytes32 contentsHash) internal view returns (bytes32) {
+        bytes32 walletDomainSep = keccak256(
+            abi.encode(
+                DOMAIN_TYPEHASH, keccak256(bytes("MockERC7739Account")), keccak256(bytes("1")), block.chainid, wallet
+            )
+        );
+        bytes32 walletStructHash = keccak256(
+            abi.encode(
+                MOCK_ERC7739_TYPED_DATA_SIGN_TYPEHASH,
+                contentsHash,
+                keccak256(bytes("MockERC7739Account")),
+                keccak256(bytes("1")),
+                block.chainid,
+                wallet
+            )
+        );
+        return keccak256(abi.encodePacked(hex"1901", walletDomainSep, walletStructHash));
+    }
+
+    function test_register_erc7739Appendix_success() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        // contentsHash must bind to THIS register call, otherwise the
+        // wrapped fallback rejects after the raw path fails.
+        bytes32 registerStructHash = keccak256(abi.encode(REGISTER_TYPEHASH, accountId, PK1X, PK1Y, expiry, uint256(0)));
+        bytes32 contentsHash = _erc7739BoundContentsHash(registerStructHash);
+        bytes memory sig = _buildErc7739Sig(_domainSeparator(), contentsHash);
+        bytes32 expectedWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), contentsHash));
+        wallet.approveSignature(expectedWrapped, sig);
+
+        vm.prank(relay);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
+
+        assertEq(registry.ownerOf(accountId), address(wallet));
+        assertEq(registry.nonces(accountId), 1);
+    }
+
+    function test_register_erc7739Appendix_rawDigestContentsHash_success() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        bytes32 rawDigest = _registerDigest(accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig = _buildErc7739Sig(_domainSeparator(), rawDigest);
+        bytes32 expectedWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), rawDigest));
+        wallet.approveSignature(expectedWrapped, sig);
+
+        vm.prank(relay);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
+
+        assertEq(registry.ownerOf(accountId), address(wallet));
+        assertEq(registry.nonces(accountId), 1);
+    }
+
+    function test_register_erc7739Appendix_shortOpaquePrefix_success() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        bytes32 rawDigest = _registerDigest(accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig = _buildErc7739SigWithInner(hex"01", _domainSeparator(), rawDigest);
+        assertEq(sig.length - 66 - 23, 1, "sanity: one-byte opaque prefix");
+        bytes32 expectedWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), rawDigest));
+        wallet.approveSignature(expectedWrapped, sig);
+
+        vm.prank(relay);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
+
+        assertEq(registry.ownerOf(accountId), address(wallet));
+        assertEq(registry.nonces(accountId), 1);
+    }
+
+    function test_register_erc7739Appendix_zeroOpaquePrefix_reverts() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        bytes32 rawDigest = _registerDigest(accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig = _buildErc7739SigWithoutInner(_domainSeparator(), rawDigest);
+        assertEq(sig.length, 66 + 23, "sanity: appendix-only sig");
+
+        vm.prank(relay);
+        vm.expectRevert(IAuthRegistry.InvalidSignatureLength.selector);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
+    }
+
+    function test_register_erc7739Appendix_rawDigestContentsHash_real7739Wallet_success() public {
+        uint256 ownerKey = 0x7739;
+        address walletOwner = vm.addr(ownerKey);
+        address relay = address(0xBEEF);
+        MockERC7739Account wallet = new MockERC7739Account(walletOwner);
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        bytes32 rawDigest = _registerDigest(accountId, PK1X, PK1Y, expiry, 0);
+        bytes32 walletDigest = _mockERC7739WalletDigest(address(wallet), rawDigest);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerKey, walletDigest);
+        bytes memory innerSig = abi.encodePacked(r, s, v);
+        bytes memory sig =
+            abi.encodePacked(innerSig, _domainSeparator(), rawDigest, bytes("Contents(bytes32 stuff)"), uint16(23));
+
+        vm.prank(relay);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
+
+        assertEq(registry.ownerOf(accountId), address(wallet));
+        assertEq(registry.nonces(accountId), 1);
+    }
+
+    /// @dev Appendix carries a different APP_DOMAIN_SEPARATOR than ours —
+    ///      contract must NOT trust it, so verification fails after the raw
+    ///      path fails.
+    ///      This is the cross-app sig replay defense.
+    function test_register_erc7739Appendix_wrongAppDomainSep_reverts() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        bytes32 registerStructHash = keccak256(abi.encode(REGISTER_TYPEHASH, accountId, PK1X, PK1Y, expiry, uint256(0)));
+        bytes32 contentsHash = _erc7739BoundContentsHash(registerStructHash);
+        bytes32 wrongSep = bytes32(uint256(0xdeadbeef));
+        bytes memory sig = _buildErc7739Sig(wrongSep, contentsHash);
+        // Wallet would have approved the wrapped hash IF we'd rewrapped under
+        // wrongSep — but we don't, because wrongSep != ours. So the wallet
+        // never sees a hash it recognises.
+        bytes32 wouldBeWrapped = keccak256(abi.encodePacked(hex"1901", wrongSep, contentsHash));
+        wallet.approveSignature(wouldBeWrapped, sig);
+
+        vm.prank(relay);
+        vm.expectRevert(IAuthRegistry.InvalidERC7739AppDomain.selector);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
+    }
+
+    /// @dev Appendix carries a contentsHash that is NOT bound to the current
+    ///      Register struct hash (e.g. it was bound to a different action,
+    ///      or to an arbitrary value). The contract MUST reject it; otherwise
+    ///      any 7739 sig the user ever produced for our domain could be
+    ///      replayed across (accountId, authPk*, expiry, nonce) tuples.
+    function test_register_erc7739Appendix_unboundContentsHash_reverts() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        // Arbitrary contentsHash NOT derived from the current Register struct hash.
+        bytes32 contentsHash = keccak256("not-bound-to-this-action");
+        bytes memory sig = _buildErc7739Sig(_domainSeparator(), contentsHash);
+        // Pre-approve the wrapped hash on the wallet so the ONLY thing
+        // standing between the attack and success is the contract's binding
+        // check. If the contract incorrectly rewraps, the wallet would
+        // accept and the test would fail.
+        bytes32 wouldBeWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), contentsHash));
+        wallet.approveSignature(wouldBeWrapped, sig);
+
+        uint256 salt = DEFAULT_SALT;
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        vm.prank(relay);
+        vm.expectRevert(IAuthRegistry.InvalidERC7739ContentsHash.selector);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
+    }
+
+    /// @dev Appendix carries a contentsDescription length other than 23.
+    ///      AuthRegistry intentionally supports only the exact implicit-mode
+    ///      Solady/Startale `Contents(bytes32 stuff)` appendix shape.
+    function test_register_erc7739Appendix_wrongContentsDescriptionLength_reverts() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        bytes32 registerStructHash = keccak256(abi.encode(REGISTER_TYPEHASH, accountId, PK1X, PK1Y, expiry, uint256(0)));
+        bytes32 contentsHash = _erc7739BoundContentsHash(registerStructHash);
+        bytes memory sig =
+            _buildErc7739SigWithDescription(_domainSeparator(), contentsHash, "MailDigest(bytes32 stuff)");
+        bytes32 wouldBeWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), contentsHash));
+        wallet.approveSignature(wouldBeWrapped, sig);
+
+        vm.prank(relay);
+        vm.expectRevert(IAuthRegistry.InvalidSignatureLength.selector);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
+    }
+
+    /// @dev Appendix is well-formed and contentsHash binds to the current
+    ///      struct hash, BUT contentsDescription is not the Solady placeholder.
+    ///      The contract MUST reject it. Pinning to the placeholder typestring
+    ///      is the safety margin that prevents future nested-typed-data shapes
+    ///      (with different hashStruct semantics) from silently routing through
+    ///      this rewrap path.
+    function test_register_erc7739Appendix_wrongContentsDescription_reverts() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        bytes32 registerStructHash = keccak256(abi.encode(REGISTER_TYPEHASH, accountId, PK1X, PK1Y, expiry, uint256(0)));
+        bytes32 contentsHash = _erc7739BoundContentsHash(registerStructHash);
+        // Same 23-byte appendix shape but with a different description.
+        bytes memory sig = _buildErc7739SigWithDescription(_domainSeparator(), contentsHash, "Contentz(bytes32 stuff)");
+        bytes32 wouldBeWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), contentsHash));
+        wallet.approveSignature(wouldBeWrapped, sig);
+
+        vm.prank(relay);
+        vm.expectRevert(IAuthRegistry.InvalidERC7739ContentsDescription.selector);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
+    }
+
+    function test_register_erc7739Appendix_wrappedSignatureRejected_reverts() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        bytes32 registerStructHash = keccak256(abi.encode(REGISTER_TYPEHASH, accountId, PK1X, PK1Y, expiry, uint256(0)));
+        bytes32 contentsHash = _erc7739BoundContentsHash(registerStructHash);
+        bytes memory sig = _buildErc7739Sig(_domainSeparator(), contentsHash);
+
+        vm.prank(relay);
+        vm.expectRevert(IAuthRegistry.InvalidERC7739WrappedSignature.selector);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
+    }
+
+    /// @dev Capture a valid 7739 sig for register(PK1) and attempt to replay
+    ///      it as register(PK2). The captured appendix binds contentsHash to
+    ///      the PK1 struct hash; the on-chain rewrap computes the accepted
+    ///      contents hashes from the PK2 call, sees the mismatch, and rejects.
+    function test_register_erc7739Appendix_replayAcrossAuthKey_reverts() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        // Wallet "signs" for register(PK1) — pre-approve the wrapped hash it
+        // would produce if the rewrap fired with the PK1-bound contentsHash.
+        bytes32 pk1StructHash = keccak256(abi.encode(REGISTER_TYPEHASH, accountId, PK1X, PK1Y, expiry, uint256(0)));
+        bytes32 capturedContentsHash = _erc7739BoundContentsHash(pk1StructHash);
+        bytes memory capturedSig = _buildErc7739Sig(_domainSeparator(), capturedContentsHash);
+        bytes32 capturedWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), capturedContentsHash));
+        wallet.approveSignature(capturedWrapped, capturedSig);
+
+        // Attacker submits register(PK2) using the captured sig. On-chain,
+        // expectedContentsHash is derived from the PK2 struct hash so does
+        // not match capturedContentsHash, so the fallback rejects.
+        vm.prank(relay);
+        vm.expectRevert(IAuthRegistry.InvalidERC7739ContentsHash.selector);
+        registry.register(salt, PK2X, PK2Y, expiry, address(wallet), capturedSig);
+    }
+
+    /// @dev Same replay shape as above, but for the Startale-compatible branch
+    ///      where contentsHash is the raw dapp EIP-712 digest. A digest captured
+    ///      for register(PK1) must not authorize register(PK2).
+    function test_register_erc7739Appendix_rawDigestReplayAcrossAuthKey_reverts() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        bytes32 capturedRawDigest = _registerDigest(accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory capturedSig = _buildErc7739Sig(_domainSeparator(), capturedRawDigest);
+        bytes32 capturedWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), capturedRawDigest));
+        wallet.approveSignature(capturedWrapped, capturedSig);
+
+        vm.prank(relay);
+        vm.expectRevert(IAuthRegistry.InvalidERC7739ContentsHash.selector);
+        registry.register(salt, PK2X, PK2Y, expiry, address(wallet), capturedSig);
+    }
+
+    /// @dev Replay across expiry: sig bound to expiry=t1 must not authorize
+    ///      a register call with expiry=t2.
+    function test_register_erc7739Appendix_replayAcrossExpiry_reverts() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry1 = uint64(block.timestamp + 1 hours);
+        uint64 expiry2 = uint64(block.timestamp + 2 hours);
+
+        bytes32 capturedStructHash =
+            keccak256(abi.encode(REGISTER_TYPEHASH, accountId, PK1X, PK1Y, expiry1, uint256(0)));
+        bytes32 capturedContentsHash = _erc7739BoundContentsHash(capturedStructHash);
+        bytes memory capturedSig = _buildErc7739Sig(_domainSeparator(), capturedContentsHash);
+        bytes32 capturedWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), capturedContentsHash));
+        wallet.approveSignature(capturedWrapped, capturedSig);
+
+        vm.prank(relay);
+        vm.expectRevert(IAuthRegistry.InvalidERC7739ContentsHash.selector);
+        registry.register(salt, PK1X, PK1Y, expiry2, address(wallet), capturedSig);
+    }
+
+    /// @dev Replay across action: sig bound to Register cannot authorize a
+    ///      Rotate. First register a wallet's key via the 7739 path, then
+    ///      attempt to rotate that key using the SAME 7739 appendix. The
+    ///      Register-bound contentsHash doesn't match the Rotate call's
+    ///      accepted contentsHash, so the fallback rejects.
+    function test_rotate_erc7739Appendix_replayFromRegister_reverts() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        // Phase 1 — legitimate register(PK1) via 7739.
+        bytes32 registerStructHash = keccak256(abi.encode(REGISTER_TYPEHASH, accountId, PK1X, PK1Y, expiry, uint256(0)));
+        bytes32 registerContentsHash = _erc7739BoundContentsHash(registerStructHash);
+        bytes memory registerSig = _buildErc7739Sig(_domainSeparator(), registerContentsHash);
+        wallet.approveSignature(
+            keccak256(abi.encodePacked(hex"1901", _domainSeparator(), registerContentsHash)), registerSig
+        );
+
+        vm.prank(relay);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), registerSig);
+        assertEq(registry.ownerOf(accountId), address(wallet));
+
+        // Phase 2 — attacker replays the SAME 7739 register sig as a rotate.
+        // The contract derives expectedContentsHash from the Rotate struct
+        // hash (different typehash + different fields + nonce=1 now); it
+        // won't match the captured Register-bound contentsHash, so the
+        // fallback rejects.
+        vm.prank(relay);
+        vm.expectRevert(IAuthRegistry.InvalidERC7739ContentsHash.selector);
+        registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, registerSig);
+    }
+
+    /// @dev Trailing uint16 length > 256 — outside the heuristic cap.
+    ///      _verifyOwnerSig MUST accept through the raw-first path before
+    ///      trying the appendix parser. Wallet only approves the raw digest
+    ///      here, so register must succeed.
+    function test_register_erc7739Appendix_oversizedContentsLength_fallback() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        // Build a sig whose tail decodes to uint16=257 — past the cap. The
+        // body is opaque; what matters is the heuristic gate rejects it.
+        bytes memory body = new bytes(200); // any payload >= 132 bytes
+        bytes memory sig = abi.encodePacked(body, uint16(257));
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes32 rawDigest = _registerDigest(accountId, PK1X, PK1Y, expiry, 0);
+        wallet.approveSignature(rawDigest, sig);
+
+        vm.prank(relay);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
+
+        assertEq(registry.ownerOf(accountId), address(wallet));
+        assertEq(registry.nonces(accountId), 1);
+    }
+
+    /// @dev Trailing uint16 declares an appendix larger than the sig can
+    ///      hold (66 + n + 65 > sigLen). _verifyOwnerSig MUST accept through
+    ///      the raw-first path before trying the appendix parser.
+    function test_register_erc7739Appendix_lengthBypass_fallback() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        // 132-byte sig (smallest length the heuristic gate inspects) whose
+        // trailing uint16 = 200. Then 66 + 200 + 65 = 331 > 132, so the
+        // appendix would not fit, but raw-first must accept it.
+        bytes memory body = new bytes(130);
+        bytes memory sig = abi.encodePacked(body, uint16(200));
+        assertEq(sig.length, 132, "sanity: sig at minimum gate length");
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes32 rawDigest = _registerDigest(accountId, PK1X, PK1Y, expiry, 0);
+        wallet.approveSignature(rawDigest, sig);
+
+        vm.prank(relay);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
+
+        assertEq(registry.ownerOf(accountId), address(wallet));
+        assertEq(registry.nonces(accountId), 1);
+    }
+
+    function test_rotateAndRevoke_eip1271ContractWallet_success() public {
+        address relay = address(0xBEEF);
+        ERC1271WalletMock wallet = new ERC1271WalletMock();
+
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(address(wallet), salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        bytes memory registerSig = hex"127101";
+        wallet.approveSignature(_registerDigest(accountId, PK1X, PK1Y, expiry, 0), registerSig);
+        vm.prank(relay);
+        registry.register(salt, PK1X, PK1Y, expiry, address(wallet), registerSig);
+
+        uint64 newExpiry = uint64(block.timestamp + 2 hours);
+        bytes memory rotateSig = hex"12710202";
+        wallet.approveSignature(_rotateDigest(accountId, PK1X, PK2X, PK2Y, newExpiry, 1), rotateSig);
+        vm.prank(relay);
+        registry.rotate(accountId, PK1X, PK2X, PK2Y, newExpiry, rotateSig);
+
+        bytes32 newAuthKeyId = registry.computeAuthKeyId(accountId, PK2X);
+        assertEq(registry.authKeyIndexOf(newAuthKeyId), 0);
+        assertEq(registry.nonces(accountId), 2);
+
+        bytes memory revokeSig = hex"1271030303";
+        wallet.approveSignature(_revokeDigest(accountId, PK2X, newExpiry, 2), revokeSig);
+        vm.prank(relay);
+        registry.revoke(accountId, PK2X, newExpiry, revokeSig);
+
+        assertTrue(registry.authKeyRevoked(newAuthKeyId));
+        assertEq(registry.nonces(accountId), 3);
     }
 
     function test_relay_disabled_after_use_reverts() public {
@@ -918,7 +1655,7 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register using relay (should succeed)
-        EcdsaSig memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
@@ -931,7 +1668,7 @@ contract AuthRegistryTest is Test {
 
         // Try to rotate using disabled relay (should revert with NotAuthorized)
         uint256 rotateNonce = registry.nonces(accountId);
-        EcdsaSig memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, rotateNonce);
+        bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, rotateNonce);
 
         vm.prank(relay);
         vm.expectRevert(IAuthRegistry.NotAuthorized.selector);
@@ -971,11 +1708,11 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register two auth keys
-        EcdsaSig memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
-        EcdsaSig memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
+        bytes memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
         vm.prank(signer);
         registry.register(salt, PK2X, PK2Y, expiry, signer, sig2);
 
@@ -985,7 +1722,7 @@ contract AuthRegistryTest is Test {
         assertFalse(registry.authKeyRevoked(authKeyId2));
 
         // Revoke first auth key
-        EcdsaSig memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 2);
+        bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 2);
 
         vm.expectEmit(true, true, true, true);
         emit IAuthRegistry.AuthKeyRevoked(accountId, authKeyId1, 0);
@@ -1007,17 +1744,17 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register auth key
-        EcdsaSig memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         // Revoke it
-        EcdsaSig memory revokeSig1 = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
+        bytes memory revokeSig1 = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
         vm.prank(signer);
         registry.revoke(accountId, PK1X, expiry, revokeSig1);
 
         // Try to revoke again
-        EcdsaSig memory revokeSig2 = _signRevoke(privateKey, accountId, PK1X, expiry, 2);
+        bytes memory revokeSig2 = _signRevoke(privateKey, accountId, PK1X, expiry, 2);
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.AuthKeyAlreadyRevoked.selector);
         registry.revoke(accountId, PK1X, expiry, revokeSig2);
@@ -1031,12 +1768,12 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register one auth key
-        EcdsaSig memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         // Try to revoke non-existent auth key
-        EcdsaSig memory revokeSig = _signRevoke(privateKey, accountId, 999, expiry, 1);
+        bytes memory revokeSig = _signRevoke(privateKey, accountId, 999, expiry, 1);
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.AuthKeyNotFound.selector);
         registry.revoke(accountId, 999, expiry, revokeSig);
@@ -1050,16 +1787,16 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register and revoke auth key
-        EcdsaSig memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
-        EcdsaSig memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
+        bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
         vm.prank(signer);
         registry.revoke(accountId, PK1X, expiry, revokeSig);
 
         // Try to rotate revoked auth key
-        EcdsaSig memory rotSig = _signRotate(privateKey, accountId, PK1X, 666, 777, expiry, 2);
+        bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, 666, 777, expiry, 2);
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.AuthKeyAlreadyRevoked.selector);
         registry.rotate(accountId, PK1X, 666, 777, expiry, rotSig);
@@ -1074,12 +1811,12 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register auth key
-        EcdsaSig memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         // Try to revoke as notAuthorized
-        EcdsaSig memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
+        bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
         vm.prank(notAuthorized);
         vm.expectRevert(IAuthRegistry.NotAuthorized.selector);
         registry.revoke(accountId, PK1X, expiry, revokeSig);
@@ -1094,12 +1831,12 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register auth key
-        EcdsaSig memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         // Try to revoke with wrong signature
-        EcdsaSig memory revokeSig = _signRevoke(wrongPrivateKey, accountId, PK1X, expiry, 1);
+        bytes memory revokeSig = _signRevoke(wrongPrivateKey, accountId, PK1X, expiry, 1);
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidSignature.selector);
         registry.revoke(accountId, PK1X, expiry, revokeSig);
@@ -1116,14 +1853,14 @@ contract AuthRegistryTest is Test {
 
         // Register auth key
         uint64 regExpiry = uint64(block.timestamp + 1 hours);
-        EcdsaSig memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, regExpiry, 0);
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, regExpiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, regExpiry, signer, regSig);
 
         // Try to revoke with expired signature
         uint64 revokeExpiry = uint64(block.timestamp - 1); // 999 < 1000
         uint256 nonce = registry.nonces(accountId); // Should be 1
-        EcdsaSig memory revokeSig = _signRevoke(privateKey, accountId, PK1X, revokeExpiry, nonce);
+        bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, revokeExpiry, nonce);
 
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.SignatureExpired.selector);
@@ -1138,14 +1875,14 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register auth key
-        EcdsaSig memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         uint256 rootBeforeRevoke = registry.authTreeRoot(0);
 
         // Revoke
-        EcdsaSig memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
+        bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
         vm.prank(signer);
         registry.revoke(accountId, PK1X, expiry, revokeSig);
 
@@ -1168,7 +1905,7 @@ contract AuthRegistryTest is Test {
         registry.setAllowedRelays(relays, true);
 
         // Register auth key (using relay)
-        EcdsaSig memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
@@ -1176,7 +1913,7 @@ contract AuthRegistryTest is Test {
         assertFalse(registry.authKeyRevoked(authKeyId));
 
         // Revoke using relay
-        EcdsaSig memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
+        bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
 
         vm.expectEmit(true, true, true, true);
         emit IAuthRegistry.AuthKeyRevoked(accountId, authKeyId, 0);
@@ -1202,7 +1939,7 @@ contract AuthRegistryTest is Test {
         registry.setAllowedRelays(relays, true);
 
         // Register auth key
-        EcdsaSig memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
@@ -1211,7 +1948,7 @@ contract AuthRegistryTest is Test {
         registry.setAllowedRelays(relays, false);
 
         // Try to revoke with disabled relay
-        EcdsaSig memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
+        bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
         vm.prank(relay);
         vm.expectRevert(IAuthRegistry.NotAuthorized.selector);
         registry.revoke(accountId, PK1X, expiry, revokeSig);
@@ -1223,7 +1960,7 @@ contract AuthRegistryTest is Test {
         uint256 accountId = 111;
 
         // Try to revoke without any registration (ownerOf[accountId] == address(0))
-        EcdsaSig memory revokeSig = _signRevoke(privateKey, accountId, PK1X, 0, 0);
+        bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, 0, 0);
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.NotRegistered.selector);
         registry.revoke(accountId, PK1X, 0, revokeSig);
@@ -1237,11 +1974,11 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register two auth keys
-        EcdsaSig memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
-        EcdsaSig memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
+        bytes memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
         vm.prank(signer);
         registry.register(salt, PK2X, PK2Y, expiry, signer, sig2);
 
@@ -1251,14 +1988,14 @@ contract AuthRegistryTest is Test {
         assertFalse(registry.authKeyRevoked(authKeyId2));
 
         // Revoke first auth key
-        EcdsaSig memory revokeSig1 = _signRevoke(privateKey, accountId, PK1X, expiry, 2);
+        bytes memory revokeSig1 = _signRevoke(privateKey, accountId, PK1X, expiry, 2);
         vm.prank(signer);
         registry.revoke(accountId, PK1X, expiry, revokeSig1);
         assertTrue(registry.authKeyRevoked(authKeyId1));
         assertFalse(registry.authKeyRevoked(authKeyId2));
 
         // Revoke second auth key
-        EcdsaSig memory revokeSig2 = _signRevoke(privateKey, accountId, PK2X, expiry, 3);
+        bytes memory revokeSig2 = _signRevoke(privateKey, accountId, PK2X, expiry, 3);
         vm.prank(signer);
         registry.revoke(accountId, PK2X, expiry, revokeSig2);
 
@@ -1281,7 +2018,7 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register
-        EcdsaSig memory regSig = _signRegister(privateKey, accountId, authPkX, authPkY, expiry, 0);
+        bytes memory regSig = _signRegister(privateKey, accountId, authPkX, authPkY, expiry, 0);
         vm.prank(signer);
         registry.register(salt, authPkX, authPkY, expiry, signer, regSig);
 
@@ -1293,7 +2030,7 @@ contract AuthRegistryTest is Test {
         // Rotate with same authPkX but new expiry
         uint64 newExpiry = uint64(block.timestamp + 2 hours);
         uint256 newAuthPkY = PK1Y_ALT; // Can change Y without changing authKeyId
-        EcdsaSig memory rotSig = _signRotate(privateKey, accountId, authPkX, authPkX, newAuthPkY, newExpiry, 1);
+        bytes memory rotSig = _signRotate(privateKey, accountId, authPkX, authPkX, newAuthPkY, newExpiry, 1);
 
         vm.expectEmit(true, true, true, true);
         emit IAuthRegistry.AuthKeyRotated(accountId, authKeyId, authPkX, newAuthPkY, originalIndex, newExpiry);
@@ -1327,7 +2064,7 @@ contract AuthRegistryTest is Test {
 
         for (uint256 i = 0; i < 5; i++) {
             uint256 nonce = registry.nonces(accountId);
-            EcdsaSig memory sig = _signRegister(privateKey, accountId, pkXs[i], pkYs[i], expiry, nonce);
+            bytes memory sig = _signRegister(privateKey, accountId, pkXs[i], pkYs[i], expiry, nonce);
             vm.prank(signer);
             registry.register(salt, pkXs[i], pkYs[i], expiry, signer, sig);
         }
@@ -1361,7 +2098,7 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // (1, 2) is not on the BabyJubJub curve
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, 1, 2, expiry, 0);
+        bytes memory sig = _signRegister(privateKey, accountId, 1, 2, expiry, 0);
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidAuthPublicKey.selector);
         registry.register(salt, 1, 2, expiry, signer, sig);
@@ -1375,7 +2112,7 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // (0, 1) is the Edwards identity and a low-order point (8*P == identity).
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, 0, 1, expiry, 0);
+        bytes memory sig = _signRegister(privateKey, accountId, 0, 1, expiry, 0);
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidAuthPublicKey.selector);
         registry.register(salt, 0, 1, expiry, signer, sig);
@@ -1392,7 +2129,7 @@ contract AuthRegistryTest is Test {
         uint256 prime = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
         uint256 yMinus1 = prime - 1;
 
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, 0, yMinus1, expiry, 0);
+        bytes memory sig = _signRegister(privateKey, accountId, 0, yMinus1, expiry, 0);
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidAuthPublicKey.selector);
         registry.register(salt, 0, yMinus1, expiry, signer, sig);
@@ -1407,7 +2144,7 @@ contract AuthRegistryTest is Test {
 
         // x >= BabyJubJub PRIME
         uint256 bigX = 21888242871839275222246405745257275088548364400416034343698204186575808495617; // PRIME
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, bigX, PK1Y, expiry, 0);
+        bytes memory sig = _signRegister(privateKey, accountId, bigX, PK1Y, expiry, 0);
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidAuthPublicKey.selector);
         registry.register(salt, bigX, PK1Y, expiry, signer, sig);
@@ -1421,12 +2158,12 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register a valid key first
-        EcdsaSig memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         // Try to rotate to an off-curve point
-        EcdsaSig memory rotSig = _signRotate(privateKey, accountId, PK1X, 1, 2, expiry, 1);
+        bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, 1, 2, expiry, 1);
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidAuthPublicKey.selector);
         registry.rotate(accountId, PK1X, 1, 2, expiry, rotSig);
@@ -1440,13 +2177,13 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         // Register a valid key first
-        EcdsaSig memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         uint64 newExpiry = uint64(block.timestamp + 2 hours);
         uint256 rotateNonce = registry.nonces(accountId);
-        EcdsaSig memory rotSig = _signRotate(privateKey, accountId, PK1X, 0, 1, newExpiry, rotateNonce);
+        bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, 0, 1, newExpiry, rotateNonce);
 
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidAuthPublicKey.selector);
@@ -1468,7 +2205,7 @@ contract AuthRegistryTest is Test {
         assertFalse(revoked1);
 
         // Register auth key
-        EcdsaSig memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
@@ -1479,7 +2216,7 @@ contract AuthRegistryTest is Test {
         assertFalse(revoked2);
 
         // Register second auth key
-        EcdsaSig memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
+        bytes memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
         vm.prank(signer);
         registry.register(salt, PK2X, PK2Y, expiry, signer, sig2);
 
@@ -1490,7 +2227,7 @@ contract AuthRegistryTest is Test {
         assertFalse(revoked3);
 
         // Revoke first auth key
-        EcdsaSig memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 2);
+        bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 2);
         vm.prank(signer);
         registry.revoke(accountId, PK1X, expiry, revokeSig);
 
@@ -1521,7 +2258,7 @@ contract AuthRegistryTest is Test {
         vm.store(address(registry), bytes32(uint256(treeStateBase) + 1), bytes32(packedCursorLeafCount));
 
         // Register should revert with RegistryFull since no more trees can be created
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         vm.expectRevert(IAuthRegistry.RegistryFull.selector);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
@@ -1550,7 +2287,7 @@ contract AuthRegistryTest is Test {
         vm.store(address(registry), bytes32(uint256(treeStateBase) + 1), bytes32(packedCursorLeafCount));
 
         // Register: should trigger rollover to tree 16 (previously reverted with MaxAuthTreesReached)
-        EcdsaSig memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
         vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
 

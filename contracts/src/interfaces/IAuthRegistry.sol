@@ -32,6 +32,21 @@ interface IAuthRegistry {
     /// @notice Thrown when the provided signature is invalid
     error InvalidSignature();
 
+    /// @notice Thrown when an ERC-7739 fallback signature has a malformed appendix length
+    error InvalidSignatureLength();
+
+    /// @notice Thrown when an ERC-7739 fallback signature is scoped to a different app domain
+    error InvalidERC7739AppDomain();
+
+    /// @notice Thrown when an ERC-7739 fallback signature uses an unsupported contents description
+    error InvalidERC7739ContentsDescription();
+
+    /// @notice Thrown when an ERC-7739 fallback signature contents hash is not bound to the current action
+    error InvalidERC7739ContentsHash();
+
+    /// @notice Thrown when an ERC-7739 fallback signature is rejected after wrapping
+    error InvalidERC7739WrappedSignature();
+
     /// @notice Thrown when the current tree is full and cannot accept new registrations
     error RegistryFull();
 
@@ -72,7 +87,7 @@ interface IAuthRegistry {
 
     /// @notice Emitted when a new account ID is registered
     /// @param accountId The unique account ID identifier
-    /// @param owner The owner EOA address
+    /// @param owner The owner address
     /// @param treeNumber The tree number where the key was registered
     /// @param authPkX The X coordinate of the approval public key
     /// @param authPkY The Y coordinate of the approval public key
@@ -153,12 +168,24 @@ interface IAuthRegistry {
     /// @notice Register a new account ID with an approval key
     /// @dev Uses EIP-712 typed signature for authorization. The account ID is derived internally as
     ///      computeAccountId(expectedOwner, salt). If the current tree is full, a new tree is created automatically.
+    ///      Supports EOAs and EIP-1271 contract wallets. EOAs should submit 65-byte signatures with v in {27,28}.
     /// @param salt User-provided salt used to derive and bind accountId to expectedOwner
     /// @param authPkX The X coordinate of the approval public key
     /// @param authPkY The Y coordinate of the approval public key
     /// @param expiry The signature expiry timestamp (0 for no expiry)
-    /// @param expectedOwner The expected owner EOA address (must match signature)
+    /// @param expectedOwner The expected owner address (must validate the signature)
     /// @param sig The EIP-712 typed signature
+    function register(
+        uint256 salt,
+        uint256 authPkX,
+        uint256 authPkY,
+        uint64 expiry,
+        address expectedOwner,
+        bytes calldata sig
+    ) external;
+
+    /// @notice Register a new account ID with a legacy 65-byte ECDSA tuple signature.
+    /// @dev Backwards-compatible selector for servers deployed before the bytes signature ABI.
     function register(
         uint256 salt,
         uint256 authPkX,
@@ -175,6 +202,7 @@ interface IAuthRegistry {
     /// @notice Rotate the approval key for a specific auth key
     /// @dev Uses EIP-712 typed signature for authorization. The auth key must exist and not be revoked.
     ///      Only the owner or an allowed relay can call this function.
+    ///      Supports EOAs and EIP-1271 contract wallets. EOAs should submit 65-byte signatures with v in {27,28}.
     ///      Use cases: (1) extend expiry without changing authPkX, (2) periodic key refresh on same device.
     ///      Unlike revoke+register, rotate reuses the Merkle slot and allows keeping the same authPkX.
     /// @param accountId The account ID
@@ -189,23 +217,39 @@ interface IAuthRegistry {
         uint256 newAuthPkX,
         uint256 newAuthPkY,
         uint64 newExpiry,
+        bytes calldata sig
+    ) external;
+
+    /// @notice Rotate an approval key with a legacy 65-byte ECDSA tuple signature.
+    /// @dev Backwards-compatible selector for servers deployed before the bytes signature ABI.
+    function rotate(
+        uint256 accountId,
+        uint256 oldAuthPkX,
+        uint256 newAuthPkX,
+        uint256 newAuthPkY,
+        uint64 newExpiry,
         EcdsaSig calldata sig
     ) external;
 
     /// @notice Revoke a specific auth key
     /// @dev Sets the leaf to zero in the Merkle tree. Revocation is permanent.
     ///      Only the owner or an allowed relay can call this function.
+    ///      Supports EOAs and EIP-1271 contract wallets. EOAs should submit 65-byte signatures with v in {27,28}.
     ///      Note: The Merkle tree slot is permanently consumed and cannot be reused.
     ///      The same authPkX cannot be re-registered for security reasons.
     /// @param accountId The account ID
     /// @param authPkX The X coordinate of the auth key to revoke
     /// @param expiry The signature expiry timestamp (0 for no expiry)
     /// @param sig The EIP-712 typed signature from the owner
+    function revoke(uint256 accountId, uint256 authPkX, uint64 expiry, bytes calldata sig) external;
+
+    /// @notice Revoke a specific auth key with a legacy 65-byte ECDSA tuple signature.
+    /// @dev Backwards-compatible selector for servers deployed before the bytes signature ABI.
     function revoke(uint256 accountId, uint256 authPkX, uint64 expiry, EcdsaSig calldata sig) external;
 
     /// @notice Compute the leaf hash for a registration
     /// @dev Uses Poseidon2MD hash with DOMAIN_REG_LEAF domain separator.
-    ///      Owner EOA is no longer included in the leaf hash as it can be
+    ///      Owner address is no longer included in the leaf hash as it can be
     ///      retrieved via ownerOf(accountId) when needed.
     /// @param accountId The account ID
     /// @param authPkX The X coordinate of the approval public key
