@@ -1,0 +1,27 @@
+# Appendix A: Protocol Glossary
+
+| Term | Definition |
+|------|------------|
+| **Note / UTXO** | An unspent transaction output representing a unit of shielded value, defined by a recipient note public key (NPK), token ID, value, and per-note randomness (`noteRnd`). A user's balance is the set of their unspent notes. |
+| **Commitment** | The on-chain Poseidon2 hash of a note, `Poseidon(DOMAIN_NOTE, NPK, tokenId, value)`, appended as a leaf to a note Merkle tree. It hides token type, amount, and owner. |
+| **Nullifier** | A one-time-use tag published when a note is spent, `Poseidon(DOMAIN_NULLIFIER + treeNumber * NullifierTreeNumberMultiplier, nullifyingKey, leafIndex)`. Recorded in `nullifierSpent` to prevent double-spends; unlinkable to its source commitment. |
+| **Epoch** | A batch of transfer/withdraw operations placed into one circuit instance and submitted as a single Groth16 proof via `submitEpoch`. The proof object is fixed-size, while verifier work and gas also include public-input-dependent MSM cost. |
+| **MPK / NPK** | Master Public Key `MPK = Poseidon(DOMAIN_MPK, accountId, nullifyingKey)`; Note Public Key `NPK = Poseidon(DOMAIN_NOTE, MPK, noteRnd)`. NPK is bound into each commitment. |
+| **Nullifying key (nk)** | A user secret that deterministically derives nullifiers and the MPK; required to spend a note, distinct from the auth key. |
+| **Auth key** | A per-account EdDSA (BabyJubJub) signing key registered in `AuthRegistry`. The in-circuit EdDSA signature over the approval digest authorizes a spend; multiple keys per account are supported for multi-device. |
+| **AccountId** | An account identifier `Poseidon(DOMAIN_ACCOUNTID, uint160(owner), salt)` binding the on-chain owner address to a shielded account; prevents account squatting. |
+| **Auth leaf / auth node** | Leaf `Poseidon(DOMAIN_REG_LEAF, accountId, authPkX, authPkY, expiry)` and internal node `Poseidon(DOMAIN_REG_NODE, left, right)` of the AuthRegistry Merkle tree proven by the circuit. |
+| **Approval digest** | The operation digest the user EdDSA-signs in-circuit (`Poseidon(DOMAIN_APPROVE, hi, lo)` over the keccak digest's two 128-bit halves), binding the signature to the exact operation. |
+| **Operation digest** | A `keccak256(abi.encode(...))` over a domain tag (`PB:TRANSFER:v1`, `PB:WITHDRAW:v1`, `PB:FORCED_WITHDRAW:v1`) plus chainId, pool, root, nullifiers, outputs, and keys; split into `(hi, lo)` 128-bit halves for circuit consumption. |
+| **Domain separator** | A constant prefix distinguishing hash/digest contexts: Poseidon domain tags listed in Appendix B and the ASCII `PB:*:v1` keccak digest tags. Prevents cross-context hash collisions. |
+| **Merkle tree / frontier** | Append-only fixed-depth (configured note-tree depth **24**; auth-tree depth 20) Poseidon2 tree of note commitments. The frontier is the minimal state (count + boundary hashes) needed to append outputs and prove the `(CountOld, RootOld) → (CountNew, RootNew)` transition. |
+| **Root history** | A 64-entry (`ROOT_HISTORY_SIZE`) ring buffer of recent tree roots maintained on-chain so proofs may reference historical roots; the same size applies to the AuthRegistry. |
+| **Rollover** | The transition to a fresh empty tree when the active tree is full (`CountOld == 2^depth`); advances `currentTreeNumber` on-chain and resets the in-circuit frontier. |
+| **Tree number** | A 15-bit identifier of a note or auth tree. Up to 16 tree numbers are packed into one field element; the nullifier domain mixes `treeNumber * NullifierTreeNumberMultiplier` to prevent cross-tree nullifier collisions. |
+| **Forced withdrawal** | The escape hatch: a client-side `ForcedWithdrawCircuit` proof spends up to `MaxInputs` notes to a public address with **no TEE proving or epoch sequencing**. Requires a pre-existing relay-created auth snapshot covering the caller's auth key, a live chain, and the `forcedWithdrawalDelay` timelock; 2-step (`requestForcedWithdrawal` then `executeForcedWithdrawal` after `forcedWithdrawalDelay` blocks). |
+| **Deposit request / request ID** | A user-initiated `requestDeposit` reserving a public deposit; bound to `requestId = Poseidon(DOMAIN_DEPOSIT_REQUEST, chainId, pool, depositor, tokenId, totalAmount, nonce, commitmentsHash)` so the batch processor cannot alter parameters. |
+| **Public inputs** | The positional field-element vector built by `LibPublicInputs` and checked by the on-chain Groth16 verifier. Non-exhaustive examples include roots, packed tree numbers, packed counts, new roots, auth roots, nullifiers, commitments, digest halves, and fee data. |
+| **Viewing key** | A user secret enabling decryption of note metadata (token, amount, owner) addressed to them. Grants read visibility but cannot spend or produce nullifiers. |
+| **Relay** | A whitelisted address authorized to submit epoch and deposit-epoch proofs (`onlyRelay`), enforced on-chain to block outsider front-running. |
+| **Trusted setup / ceremony** | The per-circuit multi-party Groth16 setup (Phase 1 powers-of-tau + Phase 2 per-circuit contributions) producing the proving/verifying keys; integrity is required for soundness and is established by the documented ceremony with a verifiable public bundle. |
+| **Verifying key (VK)** | The per-circuit-shape constants the on-chain Groth16 verifier uses; registered by the owner and dispatched per `(maxTransfers, maxInputsPerTransfer, maxOutputsPerTransfer)` shape. |
