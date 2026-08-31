@@ -120,6 +120,7 @@ func computeEdDSAVerifyArtifacts(
 	// Subgroup order constant (BabyJubJub subgroup order):
 	// 2736030358979909402780800718157159386076813972158567259200215660948447373041
 	subgroupOrder, _ := new(big.Int).SetString("2736030358979909402780800718157159386076813972158567259200215660948447373041", 10)
+	maxCanonicalScalar := new(big.Int).Sub(subgroupOrder, big.NewInt(1))
 
 	// Convert S to binary (254 bits for CompConstant).
 	sBits := api.ToBinary(s, 254)
@@ -139,8 +140,8 @@ func computeEdDSAVerifyArtifacts(
 	// Process 127 parts (2 bits each, covering 254 bits)
 	for i := 0; i < 127; i++ {
 		// Extract 2 bits from constant
-		clsb := uint(subgroupOrder.Bit(i * 2))
-		cmsb := uint(subgroupOrder.Bit(i*2 + 1))
+		clsb := uint(maxCanonicalScalar.Bit(i * 2))
+		cmsb := uint(maxCanonicalScalar.Bit(i*2 + 1))
 
 		// Extract 2 bits from S
 		slsb := sBits[i*2]
@@ -189,8 +190,9 @@ func computeEdDSAVerifyArtifacts(
 	}
 
 	// Extract the MSB of the comparison result.
-	// - If S >= order, sumBits[127] == 1.
-	// - We enforce S < order by constraining sTooLargeBit == 0 at the call site.
+	// CompConstant returns 1 when S is strictly greater than its constant, so
+	// comparing against order - 1 rejects every non-canonical scalar S >= order.
+	// The call site enforces S < order by constraining sTooLargeBit == 0.
 	sumBits := api.ToBinary(sum, 135)
 	sTooLargeBit := sumBits[127]
 
@@ -222,10 +224,13 @@ func computeEdDSAVerifyArtifacts(
 	}
 
 	// Verify signature equation: S*B8 == R8 + h*(8*A).
-	right := curve.Add(R8, curve.ScalarMul(A8, hValue))
+	hA8 := curve.ScalarMul(A8, hValue)
+	curve.AssertIsOnCurve(hA8)
+	right := curve.Add(R8, hA8)
 
 	// Calculate left = S*B8
 	left := curve.ScalarMul(B8, s)
+	curve.AssertIsOnCurve(left)
 
 	return eddsaVerifyArtifacts{
 		sTooLargeBit: sTooLargeBit,

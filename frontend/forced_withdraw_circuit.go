@@ -25,8 +25,8 @@ import (
 // This circuit proves a manual exit ("forced withdrawal") that spends up to MaxInputs input notes.
 //
 // What this circuit enforces (high level):
-//   - **Auth**: a single EdDSA signature over an approval digest is valid and the signer is registered
-//     in the selected auth registry tree (Merkle membership proof).
+//   - **Auth**: a single EdDSA signature or dedicated size-1 Safe approval authorizes the digest, and
+//     the resulting auth leaf equals the live leaf supplied by the pool as a public input.
 //   - **Spend**: each active input note exists in a selected historical commitment tree (Merkle
 //     membership proof), matches a public `InputCommitments[i]`, and produces a public nullifier.
 //   - **Withdrawal binding**: the withdrawal token id matches the transfer token id, and the withdrawal
@@ -40,9 +40,10 @@ import (
 // - `inputActive[i] := (i < Pub.NIn)` and inactive input slots are zero padded.
 //
 // What this circuit does NOT prove:
-// - It does not interpret auth leaf fields (expiry/flags) beyond hashing them into the auth leaf and proving membership.
-// - It does not prove uniqueness of nullifiers; uniqueness is enforced on-chain.
-// - It does not prove that NoteKnownRoots/AuthKnownRoots correspond to contract histories; the contract verifies that.
+//   - It does not prove auth Merkle membership. Forced withdrawal deliberately exposes an auth locator;
+//     PrivacyBoost reads that exact AuthRegistry leaf once, when accepting the request.
+//   - It does not prove uniqueness of nullifiers; uniqueness is enforced on-chain.
+//   - It does not prove that NoteKnownRoots correspond to contract history; the contract verifies that.
 //
 // Witness author notes:
 // - Arrays are fixed-size. Only the first `NIn` entries are active; all others MUST be zero.
@@ -63,18 +64,13 @@ type ForcedWithdrawCircuit struct {
 type ForcedWithdrawShape struct {
 	MaxInputs            int // maximum number of input notes
 	MerkleDepth          int // depth of note commitment trees (leaf capacity = 2^MerkleDepth)
-	AuthDepth            int // depth of auth registry trees
 	MaxNoteRootsPerProof int // number of note roots provided in a proof
-	MaxAuthRootsPerProof int // number of auth roots provided in a proof
 }
 
 type ForcedWithdrawPublicInputs struct {
 	// Note tree roots (multi-tree input support).
 	NoteKnownRoots             []frontend.Variable `gnark:",public"` // [MaxNoteRootsPerProof] historical note commitment tree roots
 	NoteKnownTreeNumbersPacked frontend.Variable   `gnark:",public"` // packed tree numbers (15 bits each)
-
-	AuthKnownRoots             []frontend.Variable `gnark:",public"` // [MaxAuthRootsPerProof] auth registry roots
-	AuthKnownTreeNumbersPacked frontend.Variable   `gnark:",public"` // packed auth tree numbers (15 bits each)
 
 	NIn              frontend.Variable   `gnark:",public"` // number of active inputs (1..MaxInputs)
 	SpenderAccountId frontend.Variable   `gnark:",public"` // account id for owner lookup on-chain
@@ -87,11 +83,12 @@ type ForcedWithdrawPublicInputs struct {
 	WithdrawalTo      frontend.Variable `gnark:",public"` // withdrawal recipient (contract-defined encoding)
 	WithdrawalTokenID frontend.Variable `gnark:",public"` // token id of the withdrawal
 	WithdrawalAmount  frontend.Variable `gnark:",public"` // gross amount (total input value; fee deducted by contract)
+	AuthLeaf          frontend.Variable `gnark:",public"` // live AuthRegistry leaf read by PrivacyBoost
+	AuthContext       frontend.Variable `gnark:",public"` // packed expiry/mode/leaf-index/tree/version context
 }
 
 type ForcedWithdrawPrivateInputs struct {
 	InputNoteTreeNumber []frontend.Variable // [MaxInputs] which note tree each input spends from (15-bit global id)
-	AuthTreeNumber      frontend.Variable   // which auth tree contains the auth key (15-bit global id)
 
 	TransferTokenID frontend.Variable // token id expected for all inputs
 	NullifyingKey   frontend.Variable // secret; used for MPK and nullifier derivation
@@ -101,10 +98,7 @@ type ForcedWithdrawPrivateInputs struct {
 	AuthSigR8x frontend.Variable // signature R8.x
 	AuthSigR8y frontend.Variable // signature R8.y
 	AuthSigS   frontend.Variable // signature scalar S
-
-	AuthExpiry       frontend.Variable   // expiry included in auth leaf hash
-	AuthLeafIndex    frontend.Variable   // leaf index in auth tree
-	AuthPathElements []frontend.Variable // [AuthDepth] Merkle path elements for auth proof
+	Blinding   frontend.Variable // Safe approval commitment blinding
 
 	InputTokenID       []frontend.Variable   // [MaxInputs] token id for each input note
 	InputValue         []frontend.Variable   // [MaxInputs] value for each input note
@@ -127,24 +121,20 @@ type forcedWithdrawInternalState struct {
 //   - These sizing parameters define the circuit shape at compile time.
 //   - They do not add constraints by themselves, but they determine how many constraints exist once
 //     `Define` is executed (more inputs/depth => larger circuit).
-func NewForcedWithdrawCircuit(maxInputs, merkleDepth, authDepth, maxNoteRootsPerProof, maxAuthRootsPerProof int) *ForcedWithdrawCircuit {
+func NewForcedWithdrawCircuit(maxInputs, merkleDepth, _ int, maxNoteRootsPerProof, _ int) *ForcedWithdrawCircuit {
 	c := &ForcedWithdrawCircuit{
 		Shape: ForcedWithdrawShape{
 			MaxInputs:            maxInputs,
 			MerkleDepth:          merkleDepth,
-			AuthDepth:            authDepth,
 			MaxNoteRootsPerProof: maxNoteRootsPerProof,
-			MaxAuthRootsPerProof: maxAuthRootsPerProof,
 		},
 		Pub: ForcedWithdrawPublicInputs{
 			NoteKnownRoots:   make([]frontend.Variable, maxNoteRootsPerProof),
-			AuthKnownRoots:   make([]frontend.Variable, maxAuthRootsPerProof),
 			Nullifiers:       make([]frontend.Variable, maxInputs),
 			InputCommitments: make([]frontend.Variable, maxInputs),
 		},
 		Priv: ForcedWithdrawPrivateInputs{
 			InputNoteTreeNumber: make([]frontend.Variable, maxInputs),
-			AuthPathElements:    make([]frontend.Variable, authDepth),
 			InputTokenID:        make([]frontend.Variable, maxInputs),
 			InputValue:          make([]frontend.Variable, maxInputs),
 			InputNoteRnd:        make([]frontend.Variable, maxInputs),
@@ -167,7 +157,7 @@ func (c *ForcedWithdrawCircuit) Define(api frontend.API) error {
 	// Build all sizing-dependent selectors and perform basic range/bounds validation.
 	state := c.validateInputs(api)
 
-	// Verify approval signature and auth registry membership.
+	// Verify approval signature and bind it to the live registry leaf supplied by the pool.
 	c.verifyAuth(api)
 
 	// Process each input note.
@@ -187,13 +177,16 @@ func (c *ForcedWithdrawCircuit) validateInputs(api frontend.API) forcedWithdrawI
 	AssertIsNBits(api, c.Pub.NIn, CountBits)
 	AssertIsNBits(api, c.Pub.WithdrawalAmount, AmountBits)
 	AssertIsNBits(api, c.Pub.WithdrawalTokenID, TokenIDBits)
+	// WithdrawalTo arrives as the pool's uint256(uint160(withdrawal.to)) encoding, so this range
+	// check is redundant for the on-chain caller and exists for callers that build the public
+	// vector themselves. The recipient's real binding is the approval digest, which the pool
+	// recomputes over the same withdrawal struct, so changing the recipient invalidates the proof
+	// with or without this check.
+	AssertIsNBits(api, c.Pub.WithdrawalTo, AddressBits)
 
 	// Enforce 1 <= NIn <= MaxInputs (a forced withdrawal with 0 inputs is semantically invalid).
 	AssertIsNonZero(api, c.Pub.NIn)
 	AssertIsLessOrEqual(api, c.Pub.NIn, uint64(c.Shape.MaxInputs), CountBits)
-
-	// Bounds check for auth tree number (single spender for forced withdrawal).
-	AssertIsLess(api, c.Priv.AuthTreeNumber, uint64(MaxAuthTreeNumber)+1, AuthTreeNumberBits+1)
 
 	// Cache inputActive selectors.
 	inputActive := make([]Bool, c.Shape.MaxInputs)
@@ -208,26 +201,62 @@ func (c *ForcedWithdrawCircuit) validateInputs(api frontend.API) forcedWithdrawI
 // =============================================================================
 
 func (c *ForcedWithdrawCircuit) verifyAuth(api frontend.API) {
+	// ToBinary returns least-significant bits first and binds the complete public AuthContext:
+	// [0,64) expiry, bit 64 mode, [65,85) leaf index, [85,100) tree number,
+	// [100,108) version, and [108,128) reserved zero bits.
+	// The locator ranges are protocol data, not padding. LibForced._resolveLiveAuth decodes
+	// them and compares both values with the live AuthRegistry record before verification.
+	contextBits := api.ToBinary(c.Pub.AuthContext, ForcedAuthContextTotalBits)
+	authExpiry := api.FromBinary(contextBits[ForcedAuthContextExpiryStart:ForcedAuthContextExpiryEnd]...)
+	useApproval := AsBool(contextBits[ForcedAuthContextModeBit])
+	AssertIsBool(api, useApproval)
+	version := api.FromBinary(contextBits[ForcedAuthContextVersionStart:ForcedAuthContextVersionEnd]...)
+	AssertEqual(api, version, ForcedAuthContextVersion)
+	for i := ForcedAuthContextUsedBits; i < ForcedAuthContextTotalBits; i++ {
+		AssertEqual(api, contextBits[i], 0)
+	}
+
 	approveMsg := Poseidon2T4(api, domainApprove, c.Pub.ApproveDigestHi, c.Pub.ApproveDigestLo)
 	pk := AffinePoint{X: c.Priv.AuthPkX, Y: c.Priv.AuthPkY}
 	sig := EdDSASignature{
 		R8: AffinePoint{X: c.Priv.AuthSigR8x, Y: c.Priv.AuthSigR8y},
 		S:  c.Priv.AuthSigS,
 	}
-	VerifyEdDSA(api, pk, sig, approveMsg)
+	VerifyEdDSAIf(api, Not(api, useApproval), pk, sig, approveMsg)
 
-	authLeaf := Poseidon2T4(
+	keyLeaf := Poseidon2T4(
 		api,
 		domainRegLeaf,
 		c.Pub.SpenderAccountId,
 		c.Priv.AuthPkX,
 		c.Priv.AuthPkY,
-		c.Priv.AuthExpiry,
+		authExpiry,
 	)
-	authRoot := computeDomainRoot(api, authLeaf, c.Priv.AuthLeafIndex, c.Priv.AuthPathElements, c.Shape.AuthDepth, domainRegNode)
-
-	// Prove membership: computed auth root must match a known root AND tree number must match.
-	AssertRootWithTreeNumberIf(api, True(), authRoot, c.Priv.AuthTreeNumber, c.Pub.AuthKnownRoots, c.Pub.AuthKnownTreeNumbersPacked)
+	commitment := Poseidon2T4(
+		api,
+		domainApproveCommit,
+		c.Pub.ApproveDigestHi,
+		c.Pub.ApproveDigestLo,
+		c.Priv.Blinding,
+	)
+	// Forced approvals are deliberately isolated from routine batches. Fold a
+	// single commitment with the fixed empty-subtree constants, matching
+	// AuthRegistry.approveSpend (a size-1 batch).
+	batchRoot := frontend.Variable(commitment)
+	zeroHashes := computeZeroHashes(SpendApprovalBatchDepth)
+	for level := 0; level < SpendApprovalBatchDepth; level++ {
+		batchRoot = Poseidon2T4(api, batchRoot, zeroHashes[level])
+	}
+	approvalLeaf := Poseidon2T4(
+		api,
+		domainApprovalLeaf,
+		c.Pub.SpenderAccountId,
+		batchRoot,
+		authExpiry,
+	)
+	authLeaf := Select(api, useApproval, approvalLeaf, keyLeaf)
+	AssertEqual(api, authLeaf, c.Pub.AuthLeaf)
+	AssertIsNonZeroIf(api, useApproval, authExpiry)
 }
 
 func (c *ForcedWithdrawCircuit) processInputs(api frontend.API, state forcedWithdrawInternalState) frontend.Variable {
@@ -262,6 +291,13 @@ func (c *ForcedWithdrawCircuit) processInputs(api frontend.API, state forcedWith
 
 		// Compute input NPK = Hash(domainNote, MPK, noteRnd).
 		inputNPK := Poseidon2T4(api, domainNote, masterPublicKey, c.Priv.InputNoteRnd[i])
+
+		// Refuse the reserved low range. A withdrawal marker is a note commitment whose key slot
+		// holds a 160-bit recipient address, and the input key below is a Poseidon output, so
+		// reaching a marker costs a preimage search rather than a choice of witness. This is
+		// defense in depth behind the tree fix, not the thing standing between a forced request
+		// and already-paid-out value.
+		AssertSpendableNPKIf(api, inputActive, inputNPK)
 
 		// Compute input commitment = Hash(domainNote, NPK, tokenId, value) and bind to public InputCommitments.
 		commitment := Poseidon2T4(api, domainNote, inputNPK, c.Priv.InputTokenID[i], c.Priv.InputValue[i])

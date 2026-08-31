@@ -90,11 +90,51 @@ func isLessOrEqualConst(api frontend.API, value frontend.Variable, bound uint64,
 	return Or(api, lt, eq)
 }
 
+// isLessOrEqualBits returns true if a <= b, where both operands are already
+// little-endian bit decompositions of the same length.
+func isLessOrEqualBits(api frontend.API, aBits, bBits []frontend.Variable) Bool {
+	if len(aBits) != len(bBits) {
+		panic("isLessOrEqualBits: operands must have same bit length")
+	}
+
+	var lt frontend.Variable = 0
+	var eq frontend.Variable = 1
+	for i := len(aBits) - 1; i >= 0; i-- {
+		lessAtBit := api.Mul(eq, api.Mul(api.Sub(1, aBits[i]), bBits[i]))
+		lt = Or(api, AsBool(lt), AsBool(lessAtBit)).AsField()
+		eq = api.Mul(eq, IsEqual(api, aBits[i], bBits[i]).AsField())
+	}
+	return Or(api, AsBool(lt), AsBool(eq))
+}
+
 // isGreaterThanConst returns true if value > bound, else false.
 //
 // Implemented as NOT(value <= bound).
 func isGreaterThanConst(api frontend.API, value frontend.Variable, bound uint64, bitLen int) Bool {
 	return Not(api, isLessOrEqualConst(api, value, bound, bitLen))
+}
+
+// isLessThanVar returns true if a < b for two circuit variables, comparing over `bitLen` bits.
+//
+// Both operands are range-checked to `bitLen` bits via ToBinary; callers must size `bitLen` to fit
+// the larger operand or the comparison is unsound. The MSB->LSB scan mirrors `isLessThanConst`, but
+// here the "constant" side is itself a witness so each per-bit branch is a circuit comparison.
+func isLessThanVar(api frontend.API, a, b frontend.Variable, bitLen int) Bool {
+	aBits := api.ToBinary(a, bitLen)
+	bBits := api.ToBinary(b, bitLen)
+
+	// lt becomes 1 the first time (while all higher bits are equal) we see aBit=0, bBit=1.
+	var lt frontend.Variable = 0
+	var eq frontend.Variable = 1
+	for i := bitLen - 1; i >= 0; i-- {
+		// aLtBit := (aBit == 0) AND (bBit == 1) == (1 - aBit) * bBit.
+		aLtBit := api.Mul(api.Sub(1, aBits[i]), bBits[i])
+		lt = api.MulAcc(lt, eq, aLtBit)
+
+		// Update eq: eq &= (aBit == bBit).
+		eq = api.Mul(eq, IsEqual(api, aBits[i], bBits[i]).AsField())
+	}
+	return AsBool(lt)
 }
 
 // =============================================================================
@@ -124,6 +164,11 @@ func isNonZero(api frontend.API, value frontend.Variable) Bool {
 // This is a "range check" wrapper around ToBinary when you don't need the bits.
 func AssertIsNBits(api frontend.API, value frontend.Variable, n int) {
 	_ = api.ToBinary(value, n)
+}
+
+// AssertIsNBitsIf enforces enabled => value fits in n bits.
+func AssertIsNBitsIf(api frontend.API, enabled Bool, value frontend.Variable, n int) {
+	_ = api.ToBinary(Select(api, enabled, value, 0), n)
 }
 
 // -----------------------------------------------------------------------------
