@@ -122,7 +122,7 @@ type DepositEpochPrivateInputs struct {
 type depositInternalState struct {
 	currentCount     frontend.Variable   // evolving leaf count for the active output tree
 	currentFrontier  []frontend.Variable // evolving frontier for the active output tree
-	fullTreeRoot     frontend.Variable   // root when tree becomes full (count = 2^depth)
+	fullTreeRoot     frontend.Variable   // root of the full tree, set by applyBatchAppend; read only when currentCount == 2^depth
 	requestActive    []Bool              // requestActive[r] := (r < NRequests)
 	commitmentActive []Bool              // commitmentActive[i] := (i < NTotalCommitments)
 }
@@ -180,8 +180,11 @@ func (c *DepositEpochCircuit) Define(api frontend.API) error {
 		AssertIsNBits(api, c.Priv.OutputValues[i], AmountBits)
 	}
 
-	// Process all commitments in a single pass and append them into the active tree.
+	// Process all commitments in a single pass.
 	c.processCommitments(api, &state)
+
+	// Append every active commitment into the output tree in one batch.
+	c.applyBatchAppend(api, &state)
 
 	// Bind the final tree state to public outputs.
 	c.assertFinalState(api, state)
@@ -195,7 +198,7 @@ func (c *DepositEpochCircuit) Define(api frontend.API) error {
 
 // validateInputs performs basic range/bounds checks and builds cached selectors used by later helpers.
 func (c *DepositEpochCircuit) validateInputs(api frontend.API) depositInternalState {
-	currentCount, currentFrontier, fullTreeRoot := c.validatePublicInputsAndInitTreeState(api)
+	currentCount, currentFrontier := c.validatePublicInputsAndInitTreeState(api)
 
 	// Cache selectors used throughout the circuit.
 	requestActive := make([]Bool, c.Shape.MaxSlots)
@@ -208,7 +211,6 @@ func (c *DepositEpochCircuit) validateInputs(api frontend.API) depositInternalSt
 	return depositInternalState{
 		currentCount:     currentCount,
 		currentFrontier:  currentFrontier,
-		fullTreeRoot:     fullTreeRoot,
 		requestActive:    requestActive,
 		commitmentActive: commitmentActive,
 	}
@@ -216,7 +218,7 @@ func (c *DepositEpochCircuit) validateInputs(api frontend.API) depositInternalSt
 
 // validatePublicInputsAndInitTreeState enforces public bounds, rollover semantics, and binds the provided
 // `NoteFrontierOld` witness to the selected active tree root (when not rolling over).
-func (c *DepositEpochCircuit) validatePublicInputsAndInitTreeState(api frontend.API) (currentCount frontend.Variable, currentFrontier []frontend.Variable, fullTreeRoot frontend.Variable) {
+func (c *DepositEpochCircuit) validatePublicInputsAndInitTreeState(api frontend.API) (currentCount frontend.Variable, currentFrontier []frontend.Variable) {
 	// Range-check and bound-check public tree inputs.
 	AssertIsNBits(api, c.Pub.CountOld, CountBits)
 	AssertIsNBits(api, c.Pub.CountNew, CountBits)
@@ -272,9 +274,7 @@ func (c *DepositEpochCircuit) validatePublicInputsAndInitTreeState(api frontend.
 	for i := 0; i < c.Shape.MerkleDepth; i++ {
 		currentFrontier[i] = Select(api, rollover, 0, c.Priv.NoteFrontierOld[i])
 	}
-	// Initialize fullTreeRoot to 0; will be updated if tree becomes full during appends.
-	fullTreeRoot = 0
-	return currentCount, currentFrontier, fullTreeRoot
+	return currentCount, currentFrontier
 }
 
 // assertTotalCommitmentCount enforces that the request headers are structurally consistent:
@@ -331,6 +331,11 @@ func (c *DepositEpochCircuit) processCommitments(api frontend.API, state *deposi
 		// Enforce positive values for active commitments (prevents zero-value leaves consuming tree capacity).
 		AssertIsNonZeroIf(api, commitmentActive, c.Priv.OutputValues[i])
 
+		// A deposit key is chosen by the depositor and never derived in-circuit, so an unchecked
+		// slot could mint a note that no spend relation will ever open. Inactive slots are already
+		// pinned to zero above, which is inside the reserved range, so the gate is required here.
+		AssertSpendableNPKIf(api, commitmentActive, c.Priv.OutputNPKs[i])
+
 		// TokenID is per-request, so we look it up by the requestIndex.
 		tokenId := SelectByIndex(api, c.Priv.TokenIDs, requestIndex)
 
@@ -381,23 +386,40 @@ func (c *DepositEpochCircuit) processCommitments(api frontend.API, state *deposi
 		requestCommitmentsHash = Select(api, shouldFinalizeRequest, 0, requestCommitmentsHash)
 		requestCommitmentIndex = Select(api, shouldFinalizeRequest, 0, requestCommitmentIndex)
 
-		// Append commitment into the active tree (gated by commitmentActive).
-		nextFrontier, nextCount, finalCarry := appendFrontier(api, state.currentFrontier, state.currentCount, c.Pub.CommitmentsOut[i], c.Shape.MerkleDepth)
-		for d := 0; d < c.Shape.MerkleDepth; d++ {
-			state.currentFrontier[d] = Select(api, commitmentActive, nextFrontier[d], state.currentFrontier[d])
-		}
-		state.currentCount = Select(api, commitmentActive, nextCount, state.currentCount)
-		state.fullTreeRoot = Select(api, commitmentActive, finalCarry, state.fullTreeRoot)
 	}
 
 	// All requests must be finalized by the end.
 	AssertEqual(api, requestIndex, c.Pub.NRequests)
 }
 
+// applyBatchAppend appends every active commitment into the output tree in one batch.
+//
+// commitmentActive[i] := (i < NTotalCommitments), so the live commitments already occupy a
+// prefix of the slot array and no routing is needed — a single packed block goes straight
+// into the batched append. That costs ~MaxSlots + MerkleDepth Poseidon permutations where
+// appending one leaf at a time cost ~MaxSlots * MerkleDepth.
+func (c *DepositEpochCircuit) applyBatchAppend(api frontend.API, state *depositInternalState) {
+	batch := newPrefixPackedList(api, c.Pub.CommitmentsOut, state.commitmentActive)
+
+	// currentCount is < 2^MerkleDepth here: rollover forces it to 0, and without rollover
+	// validatePublicInputsAndInitTreeState already required CountOld < 2^MerkleDepth.
+	// appendFrontierBatch re-checks that, plus that the batch fits in the remaining capacity.
+	nextFrontier, nextCount, finalCarry := appendFrontierBatch(
+		api,
+		state.currentFrontier,
+		state.currentCount,
+		batch,
+		c.Shape.MerkleDepth,
+	)
+	state.currentFrontier = nextFrontier
+	state.currentCount = nextCount
+	state.fullTreeRoot = finalCarry
+}
+
 // assertFinalState binds the internal working tree state to public outputs.
 func (c *DepositEpochCircuit) assertFinalState(api frontend.API, state depositInternalState) {
 	// When tree is full, computeRootFromFrontier returns incorrect result (handled internally),
-	// so we use fullTreeRoot from appendFrontier's final carry instead.
+	// so we use fullTreeRoot from the batch append's final carry instead.
 	maxCount := uint64(1) << c.Shape.MerkleDepth
 	isFull := IsEqual(api, state.currentCount, maxCount)
 

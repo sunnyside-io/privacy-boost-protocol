@@ -69,6 +69,34 @@ const (
 	// Also used for value sums, consistent with the contract's uint96 amount type.
 	AmountBits = 96
 
+	// AddressBits is the bit length for Ethereum addresses.
+	// Used by the forced-withdrawal circuit to bound WithdrawalTo, matching the pool's
+	// uint256(uint160(withdrawal.to)) encoding; the width is fixed by that ABI encoding
+	// rather than chosen for headroom.
+	AddressBits = 160
+
+	// DigestHalfBits is the bit length of each public limb of a 256-bit digest.
+	DigestHalfBits = 128
+
+	// ScalarFieldBits is the bit length of the BN254 scalar field the circuits are compiled over.
+	// A decomposition of this width is what makes gnark add its reducedness check, which is what
+	// makes a bit pattern a statement about the value rather than about one of its two possible
+	// 254-bit representations.
+	ScalarFieldBits = 254
+
+	// ReservedNPKBits marks the low range [0, 2^ReservedNPKBits) that no spendable note public key
+	// may occupy. Withdrawal markers hash a 160-bit recipient address in the NPK position under the
+	// same note domain, so reserving exactly the address width makes a marker structurally
+	// unopenable as a note without changing the marker formula or any deployed root.
+	ReservedNPKBits = AddressBits
+
+	// BlockNumberBits is the bit length for L1/L2 block numbers and gift refund deadlines.
+	// Used by the gift claim circuit to compare CurrentBlock against refundAfterBlock; 64 bits
+	// comfortably covers any realistic chain height plus MAX_GIFT_REFUND_DELAY (~13M blocks).
+	BlockNumberBits = 64
+	// TimestampBits is the bit length for auth expiry and proving timestamps.
+	TimestampBits = 64
+
 	// FeeRemainderBits is the bit length for `x mod 10_000` remainder bounds (since 10_000 < 2^14).
 	FeeRemainderBits = 14
 
@@ -92,6 +120,13 @@ const (
 	// MaxAuthRootsPerProof is the maximum number of auth roots carried in a single proof.
 	MaxAuthRootsPerProof = 16
 
+	// SpendApprovalBatchDepth is the fixed depth of the Safe spend approval
+	// batch sub-tree. Every Path B slot walks this depth from the consumed
+	// commitment to the batch root committed in the approval leaf, so one
+	// approval leaf authorizes up to 2^SpendApprovalBatchDepth spends and a
+	// spend does not reveal its batch size.
+	SpendApprovalBatchDepth = 8
+
 	// NoteTreeNumberBits is the bit length for global note tree identifiers.
 	NoteTreeNumberBits = TreeNumberBitsPerSlot
 
@@ -103,6 +138,33 @@ const (
 
 	// MaxAuthTreeNumber is the maximum valid auth tree identifier (15-bit, inclusive).
 	MaxAuthTreeNumber = (1 << AuthTreeNumberBits) - 1 // 32767
+
+	// =============================================================================
+	// Forced-withdrawal AuthContext layout
+	// =============================================================================
+	// Offsets are least-significant-bit positions in the packed uint128. The leaf-index width
+	// is fixed by the production AuthRegistry capacity, not by a circuit instance's test depth.
+
+	ForcedAuthContextExpiryStart     = 0
+	ForcedAuthContextExpiryEnd       = ForcedAuthContextExpiryStart + TimestampBits
+	ForcedAuthContextModeBit         = ForcedAuthContextExpiryEnd
+	ForcedAuthContextLeafIndexBits   = 20
+	ForcedAuthContextLeafIndexStart  = ForcedAuthContextModeBit + BoolBits
+	ForcedAuthContextLeafIndexEnd    = ForcedAuthContextLeafIndexStart + ForcedAuthContextLeafIndexBits
+	ForcedAuthContextTreeNumberStart = ForcedAuthContextLeafIndexEnd
+	ForcedAuthContextTreeNumberEnd   = ForcedAuthContextTreeNumberStart + AuthTreeNumberBits
+	ForcedAuthContextVersionBits     = 8
+	ForcedAuthContextVersionStart    = ForcedAuthContextTreeNumberEnd
+	ForcedAuthContextVersionEnd      = ForcedAuthContextVersionStart + ForcedAuthContextVersionBits
+	ForcedAuthContextUsedBits        = ForcedAuthContextVersionEnd
+	ForcedAuthContextTotalBits       = 128
+	ForcedAuthContextVersion         = 1
+	MaxForcedAuthLeafIndex           = (1 << ForcedAuthContextLeafIndexBits) - 1
+
+	// WithdrawalMaskBitsPerWord is the number of transfer slots packed into one public
+	// withdrawal-mask field element. 128 keeps a mask word well inside the scalar field and
+	// matches the digest-limb width the rest of the public vector already uses.
+	WithdrawalMaskBitsPerWord = 128
 
 	// CountsPackedSlots is the number of values in the packed counts field.
 	CountsPackedSlots = 5
@@ -152,4 +214,67 @@ var (
 	// domainMPK domain-separates master public key derivation:
 	// MPK = Poseidon(domainMPK, accountId, nullifyingKey).
 	domainMPK = big.NewInt(8)
+
+	// domainPortalBind domain-separates the portal-deposit owner binding:
+	// H = Poseidon(domainPortalBind, recipientMPK, blind).
+	// H is the public on-chain commitment that hides which account owns a portal
+	// address; the portal-deposit circuit opens it against an opaque recipientMPK witness.
+	domainPortalBind = big.NewInt(9)
+
+	// domainPortalNote domain-separates the portal-deposit note randomness:
+	// noteRnd = Poseidon(domainPortalNote, blind, E, counter).
+	// blind (the secret per-portal value) keeps the leaf unlinkable on-chain — the indexer
+	// recomputes it from the registry's (recipientMPK, blind), not from public values alone.
+	// E (the public portal address) keeps the leaf unique per portal: two portals of one
+	// recipient that share a blind would otherwise collide on one commitment, since
+	// the owner binding is write-once per E but not per H. counter keeps repeated sweeps distinct.
+	domainPortalNote = big.NewInt(10)
+
+	// domainPortalRequest domain-separates the portal-deposit request id digest:
+	// portalDepositId = keccak256(abi.encode(domainPortalRequest, chainId, pool, E, tokenId, amount, counter, H)).
+	// It is the sibling of domainDepositRequest for the hidden-recipient sweep path; keccak (not
+	// Poseidon) because this id is only an on-chain key, never a circuit input.
+	domainPortalRequest = big.NewInt(11)
+
+	// The gift (claimable-transfer) separators follow the portal block at 12..14 — portal
+	// claimed 9..11 first, so gift moves up to keep the global Poseidon domain namespace
+	// collision-free (values must equal their prover/core and Solidity counterparts).
+
+	// domainGiftBind domain-separates claimable-transfer gift-note public key derivation:
+	// giftNPK = Poseidon(domainGiftBind, W, Poseidon(domainGiftBind, blind, refundField)).
+	// Used twice (inner + outer) so a gift NPK cannot collide with a normal note NPK
+	// (domainNote), keeping gift notes spendable only by the gift claim circuit.
+	domainGiftBind = big.NewInt(12)
+
+	// domainGiftRefund domain-separates the sender's refund binding:
+	// refundField = Poseidon(domainGiftRefund, senderMPK, refundAfterBlock).
+	// It excludes tokenId/amount (those are bound by C_gift) so the claim branch
+	// never has to open refundField, preserving the claim/refund shared-nullifier XOR.
+	domainGiftRefund = big.NewInt(13)
+
+	// domainGiftNull domain-separates the gift nullifier, tree-number-bound like a
+	// normal note nullifier:
+	// GiftNullifier = Poseidon(domainGiftNull + fundingTreeNumber*NullifierTreeNumberMultiplier, giftNPK, giftLeafIndex).
+	domainGiftNull = big.NewInt(14)
+
+	// domainGiftSecret domain-separates the secret-bearer claim commitment (off-by-default, audit-gated):
+	// in secret-claim mode the gift's W slot is W = Poseidon(domainGiftSecret, claimSecret), so
+	// proving knowledge of claimSecret authorizes the claim without any wallet/auth binding.
+	domainGiftSecret = big.NewInt(15)
+	// domainApprovalLeaf domain-separates Safe spend approval leaves.
+	domainApprovalLeaf = big.NewInt(16)
+
+	// domainApproveCommit domain-separates Safe spend approval commitments.
+	domainApproveCommit = big.NewInt(17)
+
+	// domainApprovalDisplay binds a Path-B approval blinding to the actual
+	// token and fee constrained by the epoch circuit.
+	domainApprovalDisplay = big.NewInt(18)
 )
+
+// EpochWithdrawalMaskWords returns the number of public mask words an epoch circuit of the given
+// transfer capacity declares. The count is part of the circuit shape, so the contract's packing
+// loop and the witness builder must derive it from here rather than assume a single word.
+func EpochWithdrawalMaskWords(maxTransfers int) int {
+	return (maxTransfers + WithdrawalMaskBitsPerWord - 1) / WithdrawalMaskBitsPerWord
+}
