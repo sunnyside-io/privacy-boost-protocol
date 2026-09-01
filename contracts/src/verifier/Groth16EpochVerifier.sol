@@ -54,11 +54,44 @@ contract Groth16EpochVerifier is Groth16Verifier {
         if (vkConstants_ == address(0)) revert InvalidVKConstants();
         if (icLen_ == 0) revert InvalidICLength();
 
+        // Read each code size only inside its own non-zero branch. A zero-address
+        // slot is skipped by the verification loader too, so probing it would spend
+        // a cold account access on a slot neither path ever reads.
+        uint256 icxBytes;
+        uint256 icyBytes;
+        for (uint256 i = 0; i < icxSources_.length; i++) {
+            if (icxSources_[i] != address(0)) {
+                uint256 icxCodeLength = icxSources_[i].code.length;
+                if (icxCodeLength == 0 || (icxCodeLength - 1) % 32 != 0) revert InvalidICSource();
+                icxBytes += icxCodeLength - 1;
+            }
+            if (icySources_[i] != address(0)) {
+                uint256 icyCodeLength = icySources_[i].code.length;
+                if (icyCodeLength == 0 || (icyCodeLength - 1) % 32 != 0) revert InvalidICSource();
+                icyBytes += icyCodeLength - 1;
+            }
+        }
+        if (icxBytes / 32 != icLen_ || icyBytes / 32 != icLen_) revert InvalidICLength();
+        if (vkConstants_.code.length != VK_CONSTANTS_SIZE + 1) revert InvalidVKConstants();
+
         VKPointers storage vk = epochVkRegistry[maxTransfers][maxInputsPerTransfer][maxOutputsPerTransfer];
         vk.icxSources = icxSources_;
         vk.icySources = icySources_;
         vk.vkConstants = vkConstants_;
         vk.icLen = icLen_;
+    }
+
+    /// @notice Get VK info for a specific epoch circuit configuration
+    /// @return icLen IC array length
+    /// @return vkConstants Address of VK constants contract
+    function getEpochVKInfo(uint32 maxTransfers, uint32 maxInputsPerTransfer, uint32 maxOutputsPerTransfer)
+        external
+        view
+        returns (uint256 icLen, address vkConstants)
+    {
+        VKPointers storage vk = epochVkRegistry[maxTransfers][maxInputsPerTransfer][maxOutputsPerTransfer];
+        icLen = vk.icLen;
+        vkConstants = vk.vkConstants;
     }
 
     /// @notice Verify an epoch proof for a specific circuit configuration

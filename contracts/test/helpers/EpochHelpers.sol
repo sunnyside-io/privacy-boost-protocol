@@ -16,9 +16,56 @@
  */
 pragma solidity 0.8.34;
 
-import {Output, Transfer, EpochTreeState, AuthSnapshotState, TreeRootPair} from "src/interfaces/IStructs.sol";
+import {Output, Transfer, EpochTreeState, TreeRootPair, Withdrawal, GatewaySlot} from "src/interfaces/IStructs.sol";
+import {IPrivacyBoost} from "src/interfaces/IPrivacyBoost.sol";
+
+/// @dev Bundles the 15 `submitEpoch` arguments so tests can build them field-by-field and submit
+///      through {EpochHelpers.doSubmitEpoch}. The merged `submitEpoch` takes 15 calldata arguments,
+///      enough that constructing the call inline (each argument an expression held live during ABI
+///      encoding) overflows the via-IR stack in test functions with several local variables. Reading
+///      the arguments from a memory struct keeps the encode within the stack budget.
+struct SubmitArgs {
+    EpochTreeState treeState;
+    TreeRootPair[] usedAuthRoots;
+    uint32 nTransfers;
+    uint32 feeTokenCount;
+    uint256 feeNPK;
+    uint32[] inputsPerTransfer;
+    uint32[] outputsPerTransfer;
+    uint256[][] nullifiers;
+    Transfer[] transfers;
+    Transfer feeTransfer;
+    Withdrawal[] withdrawals;
+    uint32[] withdrawalSlots;
+    uint64 provingTimestamp;
+    uint256[8] proof;
+    GatewaySlot[] gatewaySlots;
+}
 
 library EpochHelpers {
+    /// @dev Submits a prebuilt {SubmitArgs}. Internal (no extra call frame, so a preceding
+    ///      `vm.prank` still applies to the `submitEpoch` call) and reads every argument from the
+    ///      memory struct, avoiding the inline 15-argument encode that overflows the via-IR stack.
+    function doSubmitEpoch(IPrivacyBoost pool, SubmitArgs memory a) internal {
+        pool.submitEpoch(
+            a.treeState,
+            a.usedAuthRoots,
+            a.nTransfers,
+            a.feeTokenCount,
+            a.feeNPK,
+            a.inputsPerTransfer,
+            a.outputsPerTransfer,
+            a.nullifiers,
+            a.transfers,
+            a.feeTransfer,
+            a.withdrawals,
+            a.withdrawalSlots,
+            a.provingTimestamp,
+            a.proof,
+            a.gatewaySlots
+        );
+    }
+
     function dummyProof() internal pure returns (uint256[8] memory) {
         return [uint256(1), 2, 3, 4, 5, 6, 7, 8];
     }
@@ -70,14 +117,6 @@ library EpochHelpers {
         });
     }
 
-    function buildAuthState(TreeRootPair[] memory usedAuthRoots, uint256 round)
-        internal
-        pure
-        returns (AuthSnapshotState memory)
-    {
-        return AuthSnapshotState({usedAuthRoots: usedAuthRoots, authSnapshotRound: round});
-    }
-
     function defaultOutputs(uint256 n) internal pure returns (Output[] memory outputs) {
         outputs = new Output[](n);
         for (uint256 i = 0; i < n; i++) {
@@ -96,7 +135,6 @@ library EpochHelpers {
         });
     }
 
-    /// @dev Returns default digestRootIndices: single word with all indices pointing to slot 0.
     function defaultDigestRootIndices() internal pure returns (uint256[] memory indices) {
         indices = new uint256[](1);
         indices[0] = 0;

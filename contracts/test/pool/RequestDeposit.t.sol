@@ -23,10 +23,48 @@ import {TokenRegistry} from "src/TokenRegistry.sol";
 import {AuthRegistry} from "src/AuthRegistry.sol";
 import {Poseidon2T4} from "src/hash/Poseidon2T4.sol";
 import {LibDigest} from "src/lib/LibDigest.sol";
-import {PendingDeposit, DepositCiphertext} from "src/interfaces/IStructs.sol";
+import {DepositOrigin, DepositCiphertext} from "src/interfaces/IStructs.sol";
 import {TOKEN_TYPE_ERC20, DOMAIN_DEPOSIT_REQUEST} from "src/interfaces/Constants.sol";
 import {MockERC20, MockFeeOnTransferToken, MockVerifier} from "test/helpers/Mocks.sol";
 import {PoolDeployer, DeployConfig} from "test/helpers/PoolDeployer.sol";
+
+contract PendingDepositObserver {
+    PrivacyBoost public immutable pool;
+    address public immutable token;
+    uint256 public requestId;
+    bool public callbackObserved;
+    address public observedDepositor;
+
+    constructor(PrivacyBoost _pool, address _token) {
+        pool = _pool;
+        token = _token;
+    }
+
+    function setRequestId(uint256 _requestId) external {
+        requestId = _requestId;
+    }
+
+    function observePendingDeposit() external {
+        require(msg.sender == token);
+        (address depositor,,,,,,,) = pool.pendingDeposits(requestId);
+        observedDepositor = depositor;
+        callbackObserved = true;
+    }
+}
+
+contract PendingDepositObservingToken is MockERC20 {
+    address public observer;
+
+    function setObserver(address _observer) external {
+        observer = _observer;
+    }
+
+    function transfer(address to, uint256 value) public override returns (bool) {
+        bool transferred = super.transfer(to, value);
+        if (to == observer) PendingDepositObserver(observer).observePendingDeposit();
+        return transferred;
+    }
+}
 
 contract RequestDepositTest is Test {
     PrivacyBoost pool;
@@ -87,7 +125,7 @@ contract RequestDepositTest is Test {
         assertEq(token.balanceOf(alice), balBefore - AMOUNT);
         assertEq(token.balanceOf(address(pool)), AMOUNT);
 
-        (address depositor, uint16 tid, uint96 totalAmt,,, uint16 commitmentCount, uint256 commitmentsHash) =
+        (address depositor, uint16 tid, uint96 totalAmt,,, uint16 commitmentCount, uint256 commitmentsHash,) =
             pool.pendingDeposits(reqId);
         assertEq(depositor, alice);
         assertEq(tid, tokenId);
@@ -111,7 +149,7 @@ contract RequestDepositTest is Test {
         vm.prank(alice);
         uint256 reqId = pool.requestDeposit(tokenId, totalAmount, commitments, cts);
 
-        (address depositor, uint16 tid, uint96 totalAmt,,, uint16 commitmentCount, uint256 commitmentsHash) =
+        (address depositor, uint16 tid, uint96 totalAmt,,, uint16 commitmentCount, uint256 commitmentsHash,) =
             pool.pendingDeposits(reqId);
         assertEq(depositor, alice);
         assertEq(tid, tokenId);
@@ -231,8 +269,43 @@ contract RequestDepositTest is Test {
         pool.cancelDeposit(reqId);
 
         assertEq(token.balanceOf(alice), balBefore + AMOUNT);
-        (address depositor,,,,,,) = pool.pendingDeposits(reqId);
+        (address depositor,,,,,,,) = pool.pendingDeposits(reqId);
         assertEq(depositor, address(0)); // cleared
+    }
+
+    function test_cancelDeposit_clearsStateBeforeRefundInteraction() public {
+        // Arrange
+        PendingDepositObservingToken observingToken = new PendingDepositObservingToken();
+        uint16 observingTokenId = tokenRegistry.register(TOKEN_TYPE_ERC20, address(observingToken), 0);
+        PendingDepositObserver observer = new PendingDepositObserver(pool, address(observingToken));
+        observingToken.setObserver(address(observer));
+        observingToken.mint(address(observer), AMOUNT);
+
+        vm.prank(address(observer));
+        observingToken.approve(address(pool), type(uint256).max);
+
+        uint256[] memory commitments = new uint256[](1);
+        commitments[0] = COMMITMENT;
+        DepositCiphertext[] memory cts = new DepositCiphertext[](1);
+        cts[0] = _dummyCiphertext();
+
+        vm.prank(address(observer));
+        uint256 reqId = pool.requestDeposit(observingTokenId, AMOUNT, commitments, cts);
+        observer.setRequestId(reqId);
+        vm.roll(block.number + pool.cancelDelay() + 1);
+
+        // Act
+        vm.prank(address(observer));
+        pool.cancelDeposit(reqId);
+
+        // Assert
+        assertTrue(observer.callbackObserved());
+        assertEq(observer.observedDepositor(), address(0));
+        assertEq(observingToken.balanceOf(address(observer)), AMOUNT);
+        assertEq(observingToken.balanceOf(address(pool)), 0);
+        (address depositor,,,,,,,) = pool.pendingDeposits(reqId);
+        assertEq(depositor, address(0));
+        assertFalse(pool.processedDeposits(reqId));
     }
 
     function test_revertWhen_cancelTooEarly() public {
@@ -334,10 +407,11 @@ contract RequestDepositTest is Test {
         );
 
         vm.prank(alice);
-        vm.expectEmit(true, true, false, true);
+        vm.expectEmit(true, true, true, true);
         emit IPrivacyBoost.DepositRequested(
             expectedReqId,
             alice,
+            DepositOrigin.UserShield,
             tokenId,
             AMOUNT,
             2, // commitmentCount

@@ -16,13 +16,15 @@
  */
 pragma solidity 0.8.34;
 
+import {MAX_NOTE_TREE_DEPTH} from "src/interfaces/Constants.sol";
+
 /// @title LibZeroHashes
-/// @notice Precomputed zero hashes for note Merkle tree (depth 24)
+/// @notice Precomputed zero hashes for note Merkle trees up to MAX_NOTE_TREE_DEPTH
 /// @dev These are hash2(left, right) computed iteratively from 0
 library LibZeroHashes {
-    /// @notice Returns precomputed zero hashes for all levels (0 to 24)
-    /// @return zeros Array of 25 zero hashes where zeros[i] is the zero hash at level i
-    function get() internal pure returns (uint256[25] memory zeros) {
+    /// @notice Returns precomputed zero hashes for all supported levels
+    /// @return zeros Zero hashes from level zero through MAX_NOTE_TREE_DEPTH
+    function get() internal pure returns (uint256[MAX_NOTE_TREE_DEPTH + 1] memory zeros) {
         zeros[0] = 0;
         zeros[1] = 5151499478991301833156025595048985053689893395646836724335623777508747990769;
         zeros[2] = 6425444215191838285069835781607981895589384041954338275956759438530131468944;

@@ -144,7 +144,7 @@ contract FeeTest is Test {
 
     function test_initialize_revertWhen_withdrawFeeExceedsMaximum() public {
         PrivacyBoost poolImpl =
-            new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 20);
+            new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 300, 64, 20);
 
         vm.expectRevert(IPrivacyBoost.FeeExceedsMaximum.selector);
         new TransparentUpgradeableProxy(
@@ -157,9 +157,10 @@ contract FeeTest is Test {
                     address(verifier),
                     address(verifier),
                     address(verifier),
+                    address(verifier),
+                    address(verifier),
                     MAX_FEE_BPS + 1, // exceeds maximum
-                    treasury, // treasury required for withdrawFee > 0
-                    300
+                    treasury // treasury required for withdrawFee > 0
                 )
             )
         );
@@ -167,7 +168,7 @@ contract FeeTest is Test {
 
     function test_initialize_revertWhen_withdrawFeeWithoutTreasury() public {
         PrivacyBoost poolImpl =
-            new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 20);
+            new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 300, 64, 20);
 
         vm.expectRevert(IPrivacyBoost.TreasuryNotSet.selector);
         new TransparentUpgradeableProxy(
@@ -180,9 +181,10 @@ contract FeeTest is Test {
                     address(verifier),
                     address(verifier),
                     address(verifier),
+                    address(verifier),
+                    address(verifier),
                     200, // withdrawFee > 0
-                    address(0), // but treasury not set
-                    300
+                    address(0) // but treasury not set
                 )
             )
         );

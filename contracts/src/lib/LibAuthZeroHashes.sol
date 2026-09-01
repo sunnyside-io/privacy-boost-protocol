@@ -16,13 +16,16 @@
  */
 pragma solidity 0.8.34;
 
+import {MAX_AUTH_TREE_DEPTH} from "src/interfaces/Constants.sol";
+
 /// @title LibAuthZeroHashes
-/// @notice Precomputed zero hashes for AuthRegistry Merkle tree (depth 24)
+/// @notice Precomputed zero hashes for AuthRegistry Merkle trees up to MAX_AUTH_TREE_DEPTH
 /// @dev These are hash3(DOMAIN_REG_NODE=5, left, right) computed iteratively from 0
+/// @custom:security-contact contact@sunnyside.io
 library LibAuthZeroHashes {
-    /// @notice Returns precomputed zero hashes for all levels (0 to 24)
-    /// @return zeros Array of 25 zero hashes where zeros[i] is the zero hash at level i
-    function get() internal pure returns (uint256[25] memory zeros) {
+    /// @notice Returns precomputed zero hashes for all supported levels
+    /// @return zeros Zero hashes from level zero through MAX_AUTH_TREE_DEPTH
+    function get() internal pure returns (uint256[MAX_AUTH_TREE_DEPTH + 1] memory zeros) {
         zeros[0] = 0;
         zeros[1] = 14918373184573644278702261945064720285050326818703388995118679503427572502917;
         zeros[2] = 14225885234615876714196316484657365761838769085049542978090384112643366605692;
@@ -44,9 +47,5 @@ library LibAuthZeroHashes {
         zeros[18] = 3560648240828999763761109946157805857159667301021936510862590656185467515446;
         zeros[19] = 17072113274626306436930955498748336222546732016942441854136347733011247042090;
         zeros[20] = 5126366598568957508996612635770875836246285197448927819410732545299241365093;
-        zeros[21] = 17272069720984612965050561881156219019862121298405989825827433069251457271433;
-        zeros[22] = 14232719439971004090900162594858170464719162040576642375543321961359343155969;
-        zeros[23] = 6801147928223435604776852033849233385413315065128723919014184193876697272034;
-        zeros[24] = 21733036029251609123427818522109193097668496808846221260502467644397073551707;
     }
 }

@@ -18,23 +18,17 @@ pragma solidity 0.8.34;
 
 import {Test} from "forge-std/Test.sol";
 
+import {AuthRegistry} from "src/AuthRegistry.sol";
 import {PrivacyBoost} from "src/PrivacyBoost.sol";
 import {IPrivacyBoost} from "src/interfaces/IPrivacyBoost.sol";
 import {TokenRegistry} from "src/TokenRegistry.sol";
 import {Poseidon2T4} from "src/hash/Poseidon2T4.sol";
-import {
-    Output,
-    Transfer,
-    Withdrawal,
-    EpochTreeState,
-    AuthSnapshotState,
-    TreeRootPair
-} from "src/interfaces/IStructs.sol";
-import {TOKEN_TYPE_ERC20, DOMAIN_NOTE} from "src/interfaces/Constants.sol";
+import {Output, Transfer, Withdrawal, TreeRootPair, GatewaySlot} from "src/interfaces/IStructs.sol";
+import {TOKEN_TYPE_ERC20, DOMAIN_NOTE, MAX_PROOF_AGE} from "src/interfaces/Constants.sol";
 
-import {MockERC20, MockVerifier, MockAuthRegistry} from "test/helpers/Mocks.sol";
+import {MockERC20, MockVerifier, MockAuthRegistry, MockRecentAuthRegistry} from "test/helpers/Mocks.sol";
 import {PoolDeployer, DeployConfig} from "test/helpers/PoolDeployer.sol";
-import {EpochHelpers} from "test/helpers/EpochHelpers.sol";
+import {EpochHelpers, SubmitArgs} from "test/helpers/EpochHelpers.sol";
 
 /// @notice Tests for submitEpoch with Withdrawal[] (V1-style withdrawal via EpochCircuit)
 contract SubmitEpochWithdrawalTest is Test {
@@ -118,6 +112,136 @@ contract SubmitEpochWithdrawalTest is Test {
         }
     }
 
+    function _deployPoolWithRecentAuth(uint64 maxStalenessBlocks)
+        internal
+        returns (PrivacyBoost recentPool, TokenRegistry recentTokenRegistry, MockRecentAuthRegistry recentAuth)
+    {
+        recentAuth = new MockRecentAuthRegistry();
+        DeployConfig memory cfg = PoolDeployer.defaultConfig(owner, proxyAdmin, address(verifier));
+        cfg.batchSize = BATCH_SIZE;
+        cfg.maxFeeTokens = MAX_FEE_TOKENS;
+        cfg.maxEpochAuthStalenessBlocks = maxStalenessBlocks;
+        cfg.maxForcedWithdrawalAuthStalenessBlocks = maxStalenessBlocks;
+        (recentPool, recentTokenRegistry) = PoolDeployer.deployWithMockAuth(cfg, address(recentAuth));
+        recentPool.setOperator(operator);
+        address[] memory relayers = new address[](1);
+        relayers[0] = relayer;
+        vm.prank(operator);
+        recentPool.setAllowedRelays(relayers, true);
+    }
+
+    function _submitBasicEpochWithAuthRoot(
+        PrivacyBoost targetPool,
+        uint256 authRoot,
+        uint256 nullifierSeed,
+        bool expectRootNotKnown
+    ) internal {
+        uint256 rootOld = targetPool.treeRoot(targetPool.currentTreeNumber());
+        uint32 countOld = targetPool.treeCount(targetPool.currentTreeNumber());
+        TreeRootPair[] memory usedRoots = EpochHelpers.buildUsedRoots(0, rootOld);
+
+        uint256[] memory nullifiers = new uint256[](BATCH_SIZE);
+        Output[] memory outputs = new Output[](BATCH_SIZE);
+        for (uint256 i = 0; i < BATCH_SIZE; ++i) {
+            nullifiers[i] = nullifierSeed + i;
+            outputs[i] = EpochHelpers.makeOutput(nullifierSeed + 100 + i);
+        }
+
+        Output[] memory feeOutputs = new Output[](MAX_FEE_TOKENS);
+        feeOutputs[0] = EpochHelpers.makeOutput(nullifierSeed + 200);
+
+        SubmitArgs memory a;
+        a.treeState = EpochHelpers.buildTreeState(usedRoots, 0, countOld, 1, countOld + 3, false);
+        a.usedAuthRoots = EpochHelpers.buildAuthRoots(0, authRoot);
+        a.nTransfers = 2;
+        a.feeTokenCount = 1;
+        a.feeNPK = 1;
+        a.inputsPerTransfer = _wrapUint32Array(1, 2);
+        a.outputsPerTransfer = _wrapUint32Array(1, 2);
+        a.nullifiers = _wrap2DNullifiers(nullifiers, 2);
+        a.transfers = _buildTransfersN(outputs, 2);
+        a.feeTransfer = EpochHelpers.buildFeeTransfer(feeOutputs);
+        a.withdrawals = new Withdrawal[](0);
+        a.withdrawalSlots = new uint32[](0);
+        a.provingTimestamp = uint64(block.timestamp);
+        a.proof = EpochHelpers.dummyProof();
+        a.gatewaySlots = new GatewaySlot[](0);
+
+        vm.prank(relayer);
+        if (expectRootNotKnown) vm.expectRevert(IPrivacyBoost.RootNotKnown.selector);
+        EpochHelpers.doSubmitEpoch(targetPool, a);
+    }
+
+    function test_submitEpoch_accepts_recent_auth_root_within_configured_window() public {
+        // Arrange
+        (PrivacyBoost recentPool,, MockRecentAuthRegistry recentAuth) = _deployPoolWithRecentAuth(4);
+        uint256 oldAuthRoot = 11;
+        recentAuth.setCurrentRoot(22);
+        recentAuth.setRecentRoot(oldAuthRoot, uint64(block.number));
+
+        // Act
+        _submitBasicEpochWithAuthRoot(recentPool, oldAuthRoot, 1000, false);
+
+        // Assert
+        assertEq(recentPool.maxEpochAuthStalenessBlocks(), 4);
+        assertEq(recentPool.treeCount(0), 3, "epoch should be accepted with recent auth root");
+    }
+
+    function test_submitEpoch_reverts_when_recent_auth_root_exceeds_configured_window() public {
+        // Arrange
+        (PrivacyBoost recentPool,, MockRecentAuthRegistry recentAuth) = _deployPoolWithRecentAuth(4);
+        uint256 oldAuthRoot = 11;
+        recentAuth.setCurrentRoot(22);
+        recentAuth.setRecentRoot(oldAuthRoot, uint64(block.number));
+        vm.roll(block.number + 5);
+
+        // Act / Assert
+        _submitBasicEpochWithAuthRoot(recentPool, oldAuthRoot, 2000, true);
+    }
+
+    function test_submitEpoch_reverts_for_revoked_approval_after_auth_root_window() public {
+        DeployConfig memory cfg = PoolDeployer.defaultConfig(owner, proxyAdmin, address(verifier));
+        cfg.batchSize = BATCH_SIZE;
+        cfg.maxFeeTokens = MAX_FEE_TOKENS;
+        cfg.maxEpochAuthStalenessBlocks = 4;
+        (PrivacyBoost approvalPool,, AuthRegistry realAuth) = PoolDeployer.deployFullStack(cfg);
+        approvalPool.setOperator(operator);
+        address[] memory relayers = new address[](1);
+        relayers[0] = relayer;
+        vm.prank(operator);
+        approvalPool.setAllowedRelays(relayers, true);
+
+        address safe = makeAddr("safe");
+        vm.prank(safe);
+        uint256 accountId = realAuth.createAccount(123);
+        uint256[] memory commitments = new uint256[](1);
+        commitments[0] = 12345;
+        vm.prank(safe);
+        realAuth.approveSpendBatch(accountId, uint64(block.timestamp + 1 days), commitments);
+
+        uint256 approvedRoot = realAuth.authTreeRoot(0);
+        uint256 batchRoot = realAuth.computeSpendApprovalBatchRoot(commitments);
+        vm.prank(safe);
+        realAuth.revokeSpendApprovalBatch(accountId, batchRoot);
+
+        assertTrue(realAuth.isRecentAuthTreeRoot(0, approvedRoot, 4));
+        vm.roll(block.number + 5);
+        assertFalse(realAuth.isRecentAuthTreeRoot(0, approvedRoot, 4));
+
+        _submitBasicEpochWithAuthRoot(approvalPool, approvedRoot, 3000, true);
+    }
+
+    function _toSingleArrays(uint256 nullifier, uint256 commitment)
+        internal
+        pure
+        returns (uint256[] memory nullifiers, uint256[] memory commitments)
+    {
+        nullifiers = new uint256[](1);
+        nullifiers[0] = nullifier;
+        commitments = new uint256[](1);
+        commitments[0] = commitment;
+    }
+
     /// @notice Test submitEpoch with a single withdrawal (happy path)
     function test_submitEpoch_singleWithdrawal_success() public {
         uint256 withdrawAmount = 100 ether;
@@ -154,11 +278,12 @@ contract SubmitEpochWithdrawalTest is Test {
         uint32 countOld = pool.treeCount(pool.currentTreeNumber());
         TreeRootPair[] memory usedRoots = EpochHelpers.buildUsedRoots(0, rootOld);
 
-        // Submit epoch with withdrawal
+        // Submit epoch with withdrawal. Two transfer outputs plus one fee note would be three new
+        // leaves, but the withdrawal's marker is not appended, so the tree grows by two.
         vm.prank(relayer);
         pool.submitEpoch(
-            EpochHelpers.buildTreeState(usedRoots, 0, countOld, 1, countOld + 3, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildTreeState(usedRoots, 0, countOld, 1, countOld + 2, false),
+            EpochHelpers.buildAuthRoots(0, 1),
             2, // nTransfers (BATCH_SIZE)
             1, // feeTokenCount
             1, // feeNPK
@@ -169,8 +294,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             withdrawals,
             withdrawalSlots,
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
 
         // Verify bob received the withdrawal
@@ -208,8 +334,8 @@ contract SubmitEpochWithdrawalTest is Test {
         vm.prank(relayer);
         vm.expectRevert(IPrivacyBoost.InvalidWithdrawal.selector);
         pool.submitEpoch(
-            EpochHelpers.buildTreeState(usedRoots, 0, countOld, 1, countOld + 3, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildTreeState(usedRoots, 0, countOld, 1, countOld + 2, false),
+            EpochHelpers.buildAuthRoots(0, 1),
             2,
             1,
             1,
@@ -220,8 +346,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             withdrawals,
             withdrawalSlots,
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
     }
 
@@ -261,8 +388,8 @@ contract SubmitEpochWithdrawalTest is Test {
         vm.prank(relayer);
         vm.expectRevert(IPrivacyBoost.InvalidWithdrawal.selector);
         pool.submitEpoch(
-            EpochHelpers.buildTreeState(usedRoots, 0, countOld, 1, countOld + 3, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildTreeState(usedRoots, 0, countOld, 1, countOld + 2, false),
+            EpochHelpers.buildAuthRoots(0, 1),
             2,
             1,
             1,
@@ -273,8 +400,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             withdrawals,
             withdrawalSlots,
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
     }
 
@@ -307,7 +435,7 @@ contract SubmitEpochWithdrawalTest is Test {
         vm.expectRevert(IPrivacyBoost.InvalidWithdrawal.selector);
         pool.submitEpoch(
             EpochHelpers.buildTreeState(usedRoots, 0, countOld, 1, countOld + 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildAuthRoots(0, 1),
             1, // nTransfers = 1 (only slot 0 is active)
             1,
             1,
@@ -318,8 +446,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             withdrawals,
             withdrawalSlots,
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
     }
 
@@ -355,7 +484,7 @@ contract SubmitEpochWithdrawalTest is Test {
         );
         pool.submitEpoch(
             EpochHelpers.buildTreeState(usedRoots, 0, countOld, 1, countOld + 3, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildAuthRoots(0, 1),
             2,
             1,
             1,
@@ -366,8 +495,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             withdrawals,
             withdrawalSlots,
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
     }
 
@@ -403,7 +533,7 @@ contract SubmitEpochWithdrawalTest is Test {
         );
         pool.submitEpoch(
             EpochHelpers.buildTreeState(usedRoots, 0, countOld, 1, countOld + 3, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildAuthRoots(0, 1),
             2,
             1,
             1,
@@ -414,8 +544,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             withdrawals,
             withdrawalSlots,
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
     }
 
@@ -442,7 +573,7 @@ contract SubmitEpochWithdrawalTest is Test {
         vm.expectRevert(IPrivacyBoost.InvalidEpochConfig.selector);
         pool.submitEpoch(
             EpochHelpers.buildTreeState(usedRoots, 0, countOld, 1, countOld + 3, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildAuthRoots(0, 1),
             2,
             1,
             1,
@@ -453,8 +584,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
     }
 
@@ -481,7 +613,7 @@ contract SubmitEpochWithdrawalTest is Test {
         vm.expectRevert(IPrivacyBoost.InvalidArrayLengths.selector);
         pool.submitEpoch(
             EpochHelpers.buildTreeState(usedRoots, 0, countOld, 1, countOld + 3, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildAuthRoots(0, 1),
             2,
             1,
             1,
@@ -492,8 +624,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
     }
 
@@ -521,7 +654,7 @@ contract SubmitEpochWithdrawalTest is Test {
         vm.expectRevert(IPrivacyBoost.InvalidNullifierSet.selector);
         pool.submitEpoch(
             EpochHelpers.buildTreeState(usedRoots, 0, countOld, 0x1234, countOld + 3, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildAuthRoots(0, 1),
             2,
             1,
             1,
@@ -532,8 +665,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
     }
 
@@ -561,7 +695,7 @@ contract SubmitEpochWithdrawalTest is Test {
         vm.expectRevert(IPrivacyBoost.InvalidSlotPadding.selector);
         pool.submitEpoch(
             EpochHelpers.buildTreeState(usedRoots, 0, countOld, 0x1234, countOld + 3, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildAuthRoots(0, 1),
             2,
             1,
             1,
@@ -572,8 +706,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
     }
 
@@ -605,7 +740,7 @@ contract SubmitEpochWithdrawalTest is Test {
         vm.expectRevert(IPrivacyBoost.InvalidEpochConfig.selector);
         pool.submitEpoch(
             EpochHelpers.buildTreeState(usedRoots, 0, countOld, 0x1234, countOld + 3, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildAuthRoots(0, 1),
             2,
             1,
             1,
@@ -616,8 +751,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
     }
 
@@ -647,7 +783,7 @@ contract SubmitEpochWithdrawalTest is Test {
         vm.expectRevert(IPrivacyBoost.InvalidEpochConfig.selector);
         pool.submitEpoch(
             EpochHelpers.buildTreeState(usedRoots, 0, countOld, 0x1234, countOld + 3, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildAuthRoots(0, 1),
             2,
             1,
             1,
@@ -658,8 +794,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
     }
 
@@ -694,7 +831,7 @@ contract SubmitEpochWithdrawalTest is Test {
         vm.expectRevert(IPrivacyBoost.InvalidEpochConfig.selector);
         pool.submitEpoch(
             EpochHelpers.buildTreeState(usedRoots, 0, countOld, 0x1234, countOld + 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildAuthRoots(0, 1),
             1, // nTransfers = 1 (partial batch, slot 1 is inactive)
             1,
             1,
@@ -705,8 +842,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
     }
 
@@ -746,7 +884,7 @@ contract SubmitEpochWithdrawalTest is Test {
         vm.prank(relayer);
         pool.submitEpoch(
             EpochHelpers.buildTreeState(usedRoots, 0, countOld, 0x1234, countOld + 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildAuthRoots(0, 1),
             1, // nTransfers = 1 (partial batch)
             1,
             1,
@@ -757,8 +895,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
 
         // Verify tree state was updated
@@ -797,7 +936,7 @@ contract SubmitEpochWithdrawalTest is Test {
         vm.expectRevert(IPrivacyBoost.InvalidSlotPadding.selector);
         pool.submitEpoch(
             EpochHelpers.buildTreeState(usedRoots, 0, countOld, 0x1234, countOld + 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildAuthRoots(0, 1),
             1,
             1,
             1,
@@ -808,8 +947,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
     }
 
@@ -851,7 +991,7 @@ contract SubmitEpochWithdrawalTest is Test {
         vm.expectRevert(IPrivacyBoost.InvalidSlotPadding.selector);
         pool2.submitEpoch(
             EpochHelpers.buildTreeState(usedRoots, 0, countOld, 0x1234, countOld + 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildAuthRoots(0, 1),
             1,
             1,
             1,
@@ -862,8 +1002,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
     }
 
@@ -888,7 +1029,7 @@ contract SubmitEpochWithdrawalTest is Test {
         vm.expectRevert(IPrivacyBoost.InvalidSlotPadding.selector);
         pool.submitEpoch(
             EpochHelpers.buildTreeState(usedRoots, 0, countOld, 0x1234, countOld + 3, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildAuthRoots(0, 1),
             2,
             1,
             1,
@@ -899,8 +1040,9 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
     }
 
@@ -925,7 +1067,7 @@ contract SubmitEpochWithdrawalTest is Test {
         vm.expectRevert(IPrivacyBoost.InvalidSlotPadding.selector);
         pool.submitEpoch(
             EpochHelpers.buildTreeState(usedRoots, 0, countOld, 0x1234, countOld + 3, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
+            EpochHelpers.buildAuthRoots(0, 1),
             2,
             1,
             1,
@@ -936,8 +1078,55 @@ contract SubmitEpochWithdrawalTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
         );
+    }
+
+    /// @dev Timestamp check fires before all other epoch validation, so
+    /// minimal calldata suffices; other args never get inspected.
+    function _submitEpochWithTimestamp(uint64 provingTimestamp) internal {
+        Output[] memory feeOutputs = new Output[](MAX_FEE_TOKENS);
+        feeOutputs[0] = EpochHelpers.makeOutput(999);
+        vm.prank(relayer);
+        pool.submitEpoch(
+            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, 1), 0, 0, 1, 0, false),
+            EpochHelpers.buildAuthRoots(0, 1),
+            0,
+            0,
+            0,
+            new uint32[](0),
+            new uint32[](0),
+            new uint256[][](0),
+            new Transfer[](0),
+            EpochHelpers.buildFeeTransfer(feeOutputs),
+            new Withdrawal[](0),
+            new uint32[](0),
+            provingTimestamp,
+            EpochHelpers.dummyProof(),
+            new GatewaySlot[](0)
+        );
+    }
+
+    /// @notice A proving timestamp ahead of block time must revert.
+    function test_revertWhen_provingTimestampInFuture() public {
+        vm.expectRevert(IPrivacyBoost.InvalidProvingTimestamp.selector);
+        _submitEpochWithTimestamp(uint64(block.timestamp + 1));
+    }
+
+    /// @notice A proving timestamp older than MAX_PROOF_AGE must revert.
+    function test_revertWhen_provingTimestampStale() public {
+        vm.warp(block.timestamp + MAX_PROOF_AGE + 2);
+        vm.expectRevert(IPrivacyBoost.InvalidProvingTimestamp.selector);
+        _submitEpochWithTimestamp(uint64(block.timestamp - MAX_PROOF_AGE - 1));
+    }
+
+    /// @notice Exactly MAX_PROOF_AGE old passes the timestamp gate: the call
+    /// proceeds to config validation, pinning the comparison direction.
+    function test_provingTimestampAtMaxAgePassesGate() public {
+        vm.warp(block.timestamp + MAX_PROOF_AGE + 2);
+        vm.expectRevert(IPrivacyBoost.InvalidEpochConfig.selector);
+        _submitEpochWithTimestamp(uint64(block.timestamp - MAX_PROOF_AGE));
     }
 }

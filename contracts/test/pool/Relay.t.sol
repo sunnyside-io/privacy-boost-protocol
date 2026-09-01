@@ -29,8 +29,8 @@ import {
     DepositCiphertext,
     DepositEntry,
     EpochTreeState,
-    AuthSnapshotState,
-    TreeRootPair
+    TreeRootPair,
+    GatewaySlot
 } from "src/interfaces/IStructs.sol";
 import {TOKEN_TYPE_ERC20} from "src/interfaces/Constants.sol";
 
@@ -178,13 +178,12 @@ contract RelayTest is Test {
         EpochTreeState memory treeState = EpochTreeState({
             usedRoots: usedRoots, activeTreeNumber: 0, countOld: 0, rootNew: 0, countNew: 0, rollover: false
         });
-        AuthSnapshotState memory authState = AuthSnapshotState({usedAuthRoots: authRoots, authSnapshotRound: 0});
 
         vm.prank(notOwner);
         vm.expectRevert(IPrivacyBoost.NotAllowedRelay.selector);
         pool.submitEpoch(
             treeState,
-            authState,
+            authRoots,
             1, // nTransfers
             1, // feeTokenCount
             0, // feeNPK
@@ -195,8 +194,9 @@ contract RelayTest is Test {
             EpochHelpers.buildFeeTransfer(feeOutputs),
             withdrawals,
             withdrawalSlots,
-            EpochHelpers.defaultDigestRootIndices(),
-            proof
+            uint64(block.timestamp),
+            proof,
+            new GatewaySlot[](0)
         );
     }
 

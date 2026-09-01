@@ -17,6 +17,7 @@
 pragma solidity 0.8.34;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {TreeRootPair} from "src/interfaces/IStructs.sol";
 
 contract MockERC20 is ERC20 {
     constructor() ERC20("Mock", "MOCK") {}
@@ -45,6 +46,25 @@ contract MockFeeOnTransferToken is ERC20 {
     }
 }
 
+/// @dev Test base making a mock contract a registrable portal `E`: it stores the owner binding H that the
+///      pool reads back via portalBinding() at sweep time — the account-side binding (PortalDelegate's
+///      EIP-7201 storage) that replaced the pool's portalH registry. initializePortal stands in for
+///      PortalDelegate.initializePortal; these mocks are plain deployed contracts used directly as E, so the
+///      real delegate's self-call gate and range/write-once guards are intentionally omitted (those run
+///      against the real delegate in Portal.t.sol / PortalDelegate.t.sol). A mock that never calls
+///      initializePortal reports portalBinding() == 0, the unregistered sentinel the sweep path rejects.
+abstract contract BindablePortal {
+    uint256 private _binding;
+
+    function initializePortal(uint256 H) external {
+        _binding = H;
+    }
+
+    function portalBinding() external view returns (uint256) {
+        return _binding;
+    }
+}
+
 contract MockVerifier {
     function verifyEpoch(uint32, uint32, uint32, uint256[8] calldata, uint256[] calldata) external pure returns (bool) {
         return true;
@@ -54,11 +74,23 @@ contract MockVerifier {
         return true;
     }
 
+    function verifyPortalDeposit(uint32, uint256[8] calldata, uint256[] calldata) external pure returns (bool) {
+        return true;
+    }
+
     function verifyWithdraw(uint256[8] calldata, uint256[] calldata) external pure returns (bool) {
         return true;
     }
 
     function verifyForcedWithdraw(uint32, uint256[8] calldata, uint256[] calldata) external pure returns (bool) {
+        return true;
+    }
+
+    function verifyGiftClaim(uint32, uint256[8] calldata, uint256[] calldata) external pure returns (bool) {
+        return true;
+    }
+
+    function hasVerifyingKey(uint32) external pure returns (bool) {
         return true;
     }
 }
@@ -79,6 +111,27 @@ contract MockAuthRegistry {
     function getAllAuthTreeRoots() external pure returns (uint256[] memory roots) {
         roots = new uint256[](1);
         roots[0] = 1;
+    }
+
+    function isCurrentAuthTreeRoot(uint256 treeNum, uint256 root) public pure returns (bool) {
+        return treeNum == 0 && root == 1;
+    }
+
+    function isCurrentAuthLeafAt(uint64, uint256 authLeaf) external pure returns (bool) {
+        return authLeaf != 0;
+    }
+
+    function isRecentAuthTreeRoot(uint256 treeNum, uint256 root, uint64) external pure returns (bool) {
+        return isCurrentAuthTreeRoot(treeNum, root);
+    }
+
+    function areRecentAuthTreeRoots(TreeRootPair[] calldata roots, uint64) external pure returns (bool) {
+        for (uint256 i = 0; i < roots.length; ++i) {
+            if (!isCurrentAuthTreeRoot(roots[i].treeNumber, roots[i].root)) {
+                return false;
+            }
+        }
+        return true;
     }
 }
 
@@ -110,6 +163,27 @@ contract MockAuthRegistryMultiTree {
         }
     }
 
+    function isCurrentAuthTreeRoot(uint256 treeNum, uint256 root) public view returns (bool) {
+        return root != 0 && treeNum <= _treeCount && _roots[treeNum] == root;
+    }
+
+    function isCurrentAuthLeafAt(uint64, uint256 authLeaf) external pure returns (bool) {
+        return authLeaf != 0;
+    }
+
+    function isRecentAuthTreeRoot(uint256 treeNum, uint256 root, uint64) external view returns (bool) {
+        return isCurrentAuthTreeRoot(treeNum, root);
+    }
+
+    function areRecentAuthTreeRoots(TreeRootPair[] calldata roots, uint64) external view returns (bool) {
+        for (uint256 i = 0; i < roots.length; ++i) {
+            if (!isCurrentAuthTreeRoot(roots[i].treeNumber, roots[i].root)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     function addAuthTree(uint256 root) external {
         _treeCount++;
         _roots[_treeCount] = root;
@@ -117,5 +191,76 @@ contract MockAuthRegistryMultiTree {
 
     function setAuthTreeRoot(uint256 treeNum, uint256 root) external {
         _roots[treeNum] = root;
+    }
+}
+
+contract MockRecentAuthRegistry {
+    uint256 private _currentRoot = 1;
+    uint256 private _recentRoot;
+    uint64 private _recentSupersededBlock;
+
+    function registryRoot() external view returns (uint256) {
+        return _currentRoot;
+    }
+
+    function currentAuthTreeNumber() external pure returns (uint256) {
+        return 0;
+    }
+
+    function authTreeRoot(uint256) external view returns (uint256) {
+        return _currentRoot;
+    }
+
+    function getAllAuthTreeRoots() external view returns (uint256[] memory roots) {
+        roots = new uint256[](1);
+        roots[0] = _currentRoot;
+    }
+
+    function setCurrentRoot(uint256 root) external {
+        _currentRoot = root;
+    }
+
+    function setRecentRoot(uint256 root, uint64 supersededBlock) external {
+        _recentRoot = root;
+        _recentSupersededBlock = supersededBlock;
+    }
+
+    function isCurrentAuthTreeRoot(uint256 treeNum, uint256 root) public view returns (bool) {
+        return root != 0 && treeNum == 0 && root == _currentRoot;
+    }
+
+    function isCurrentAuthLeafAt(uint64, uint256 authLeaf) external pure returns (bool) {
+        return authLeaf != 0;
+    }
+
+    function isRecentAuthTreeRoot(uint256 treeNum, uint256 root, uint64 maxStalenessBlocks)
+        external
+        view
+        returns (bool)
+    {
+        return _isRecentAuthTreeRoot(treeNum, root, maxStalenessBlocks);
+    }
+
+    function areRecentAuthTreeRoots(TreeRootPair[] calldata roots, uint64 maxStalenessBlocks)
+        external
+        view
+        returns (bool)
+    {
+        for (uint256 i = 0; i < roots.length; ++i) {
+            if (!_isRecentAuthTreeRoot(roots[i].treeNumber, roots[i].root, maxStalenessBlocks)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    function _isRecentAuthTreeRoot(uint256 treeNum, uint256 root, uint64 maxStalenessBlocks)
+        internal
+        view
+        returns (bool)
+    {
+        if (isCurrentAuthTreeRoot(treeNum, root)) return true;
+        if (treeNum != 0 || root == 0 || root != _recentRoot || maxStalenessBlocks == 0) return false;
+        return block.number >= _recentSupersededBlock && block.number - _recentSupersededBlock <= maxStalenessBlocks;
     }
 }

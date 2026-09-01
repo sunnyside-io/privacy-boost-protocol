@@ -25,16 +25,33 @@ import {
     Transfer,
     Withdrawal,
     EpochTreeState,
-    AuthSnapshotState,
     TreeRootPair,
-    DepositEntry
+    DepositEntry,
+    GatewaySlot
 } from "src/interfaces/IStructs.sol";
 
 import {MockVerifier, MockAuthRegistryMultiTree} from "test/helpers/Mocks.sol";
 import {PoolDeployer, DeployConfig} from "test/helpers/PoolDeployer.sol";
 import {EpochHelpers} from "test/helpers/EpochHelpers.sol";
 
-/// @notice Tests for sparse tree roots and lazy auth snapshots edge cases
+contract ActiveRootAssertingVerifier {
+    uint256 public expectedActiveRoot;
+
+    function setExpectedActiveRoot(uint256 root) external {
+        expectedActiveRoot = root;
+    }
+
+    function verifyEpoch(uint32, uint32, uint32, uint256[8] calldata, uint256[] calldata publicInputs)
+        external
+        view
+        returns (bool)
+    {
+        assert(publicInputs[19] == expectedActiveRoot);
+        return true;
+    }
+}
+
+/// @notice Tests for sparse tree roots and auth-root validation edge cases
 contract SparseRootsEdgeCasesTest is Test {
     PrivacyBoost pool;
     TokenRegistry tokenRegistry;
@@ -67,13 +84,13 @@ contract SparseRootsEdgeCasesTest is Test {
 
     // ========== Helper Functions ==========
 
-    function _submitBasicEpoch(EpochTreeState memory treeState, AuthSnapshotState memory authState) internal {
+    function _submitBasicEpoch(EpochTreeState memory treeState, TreeRootPair[] memory usedAuthRoots) internal {
         uint256[] memory nullifiers = new uint256[](1);
         nullifiers[0] = uint256(keccak256(abi.encodePacked(block.timestamp, treeState.rootNew)));
 
         pool.submitEpoch(
             treeState,
-            authState,
+            usedAuthRoots,
             1, // nTransfers
             1, // feeTokenCount
             1, // feeNPK
@@ -84,72 +101,9 @@ contract SparseRootsEdgeCasesTest is Test {
             EpochHelpers.buildFeeTransfer(new Output[](1)),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
-        );
-    }
-
-    // ========== digestRootIndices Canonical Encoding Tests ==========
-
-    function test_revertWhen_digestRootIndicesTooLong() public {
-        uint256 currentRound = block.number / 300;
-        uint256 currentTreeRoot = pool.treeRoot(0);
-
-        uint256[] memory nullifiers = new uint256[](1);
-        nullifiers[0] = uint256(keccak256(abi.encodePacked(block.timestamp, uint256(1))));
-
-        // nTransfers=1 => expectedDigestRootWords=1, so length=2 should revert
-        uint256[] memory indices = new uint256[](2);
-        indices[0] = 0;
-        indices[1] = 0;
-
-        vm.expectRevert(IPrivacyBoost.InvalidArrayLengths.selector);
-        pool.submitEpoch(
-            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, currentTreeRoot), 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound),
-            1, // nTransfers
-            1, // feeTokenCount
-            1, // feeNPK
-            EpochHelpers.singletonUint32Array(1), // inputsPerTransfer
-            EpochHelpers.singletonUint32Array(1), // outputsPerTransfer
-            EpochHelpers.wrap2D(nullifiers),
-            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            indices,
-            EpochHelpers.dummyProof()
-        );
-    }
-
-    function test_revertWhen_digestRootIndicesNonZeroPaddingBits() public {
-        uint256 currentRound = block.number / 300;
-        uint256 currentTreeRoot = pool.treeRoot(0);
-
-        uint256[] memory nullifiers = new uint256[](1);
-        nullifiers[0] = uint256(keccak256(abi.encodePacked(block.timestamp, uint256(1))));
-
-        // nTransfers=1 => only the lowest 4 bits (slot 0) are meaningful.
-        // Set a non-zero nibble for an inactive slot to make the encoding non-canonical.
-        uint256[] memory indices = new uint256[](1);
-        indices[0] = uint256(1) << 4;
-
-        vm.expectRevert(IPrivacyBoost.NonCanonicalEncoding.selector);
-        pool.submitEpoch(
-            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, currentTreeRoot), 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound),
-            1, // nTransfers
-            1, // feeTokenCount
-            1, // feeNPK
-            EpochHelpers.singletonUint32Array(1), // inputsPerTransfer
-            EpochHelpers.singletonUint32Array(1), // outputsPerTransfer
-            EpochHelpers.wrap2D(nullifiers),
-            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            indices,
-            EpochHelpers.dummyProof()
+            uint64(block.timestamp),
+            [uint256(1), 2, 3, 4, 5, 6, 7, 8],
+            new GatewaySlot[](0)
         );
     }
 
@@ -159,20 +113,14 @@ contract SparseRootsEdgeCasesTest is Test {
     function test_revert_emptyUsedRoots() public {
         TreeRootPair[] memory emptyRoots = new TreeRootPair[](0);
 
-        uint256 currentRound = block.number / 300;
-
         vm.expectRevert(IPrivacyBoost.InvalidBatchConfig.selector);
-        _submitBasicEpoch(
-            EpochHelpers.buildTreeState(emptyRoots, 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound)
-        );
+        _submitBasicEpoch(EpochHelpers.buildTreeState(emptyRoots, 0, 0, 1, 2, false), EpochHelpers.buildAuthRoots(0, 1));
     }
 
     /// @notice Test that empty usedAuthRoots array reverts with InvalidBatchConfig
     function test_revert_emptyUsedAuthRoots() public {
         TreeRootPair[] memory emptyAuthRoots = new TreeRootPair[](0);
 
-        uint256 currentRound = block.number / 300;
         uint256 currentTreeRoot = pool.treeRoot(0); // Read before expectRevert
 
         uint256[] memory nullifiers = new uint256[](1);
@@ -181,7 +129,7 @@ contract SparseRootsEdgeCasesTest is Test {
         vm.expectRevert(IPrivacyBoost.InvalidBatchConfig.selector);
         pool.submitEpoch(
             EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, currentTreeRoot), 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(emptyAuthRoots, currentRound),
+            emptyAuthRoots,
             1, // nTransfers
             1, // feeTokenCount
             1, // feeNPK
@@ -192,8 +140,9 @@ contract SparseRootsEdgeCasesTest is Test {
             EpochHelpers.buildFeeTransfer(new Output[](1)),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
+            uint64(block.timestamp),
+            [uint256(1), 2, 3, 4, 5, 6, 7, 8],
+            new GatewaySlot[](0)
         );
     }
 
@@ -207,12 +156,9 @@ contract SparseRootsEdgeCasesTest is Test {
             tooManyRoots[i] = TreeRootPair({treeNumber: i, root: pool.treeRoot(0)});
         }
 
-        uint256 currentRound = block.number / 300;
-
         vm.expectRevert(IPrivacyBoost.InvalidBatchConfig.selector);
         _submitBasicEpoch(
-            EpochHelpers.buildTreeState(tooManyRoots, 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound)
+            EpochHelpers.buildTreeState(tooManyRoots, 0, 0, 1, 2, false), EpochHelpers.buildAuthRoots(0, 1)
         );
     }
 
@@ -224,7 +170,6 @@ contract SparseRootsEdgeCasesTest is Test {
             tooManyAuthRoots[i] = TreeRootPair({treeNumber: i, root: 1});
         }
 
-        uint256 currentRound = block.number / 300;
         uint256 currentTreeRoot = pool.treeRoot(0); // Read before expectRevert
 
         uint256[] memory nullifiers = new uint256[](1);
@@ -233,7 +178,7 @@ contract SparseRootsEdgeCasesTest is Test {
         vm.expectRevert(IPrivacyBoost.InvalidBatchConfig.selector);
         pool.submitEpoch(
             EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, currentTreeRoot), 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(tooManyAuthRoots, currentRound),
+            tooManyAuthRoots,
             1, // nTransfers
             1, // feeTokenCount
             1, // feeNPK
@@ -244,8 +189,9 @@ contract SparseRootsEdgeCasesTest is Test {
             EpochHelpers.buildFeeTransfer(new Output[](1)),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
+            uint64(block.timestamp),
+            [uint256(1), 2, 3, 4, 5, 6, 7, 8],
+            new GatewaySlot[](0)
         );
     }
 
@@ -255,13 +201,8 @@ contract SparseRootsEdgeCasesTest is Test {
         TreeRootPair[] memory roots = new TreeRootPair[](1);
         roots[0] = TreeRootPair({treeNumber: 0, root: pool.treeRoot(0)});
 
-        uint256 currentRound = block.number / 300;
-
         // Should succeed with single valid root
-        _submitBasicEpoch(
-            EpochHelpers.buildTreeState(roots, 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound)
-        );
+        _submitBasicEpoch(EpochHelpers.buildTreeState(roots, 0, 0, 1, 2, false), EpochHelpers.buildAuthRoots(0, 1));
 
         assertEq(pool.treeRoot(0), 1, "Root should be updated");
     }
@@ -274,13 +215,11 @@ contract SparseRootsEdgeCasesTest is Test {
         TreeRootPair[] memory roots = new TreeRootPair[](1);
         roots[0] = TreeRootPair({treeNumber: 0, root: pool.treeRoot(0)});
 
-        uint256 currentRound = block.number / 300;
-
         // activeTreeNumber=1 but usedRoots only contains tree 0
         vm.expectRevert(IPrivacyBoost.InvalidEpochState.selector);
         _submitBasicEpoch(
             EpochHelpers.buildTreeState(roots, 1, 0, 1, 2, false), // activeTreeNumber=1
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound)
+            EpochHelpers.buildAuthRoots(0, 1)
         );
     }
 
@@ -288,13 +227,12 @@ contract SparseRootsEdgeCasesTest is Test {
     /// The contract reads activeRoot from treeRoot[activeTreeNumber] for frontier binding,
     /// so usedRoots can carry a past root for input spending.
     function test_activeTreeWithHistoricalRoot() public {
-        uint256 currentRound = block.number / 300;
         uint256 initialRoot = pool.treeRoot(0);
 
         // First epoch: advance tree 0 root (initialRoot -> 1001)
         _submitBasicEpoch(
             EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, initialRoot), 0, 0, 1001, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound)
+            EpochHelpers.buildAuthRoots(0, 1)
         );
         assertEq(pool.treeRoot(0), 1001, "Root should be 1001 after first epoch");
 
@@ -305,7 +243,7 @@ contract SparseRootsEdgeCasesTest is Test {
 
         pool.submitEpoch(
             EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, initialRoot), 0, 2, 1002, 4, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound),
+            EpochHelpers.buildAuthRoots(0, 1),
             1,
             1,
             1,
@@ -316,8 +254,46 @@ contract SparseRootsEdgeCasesTest is Test {
             EpochHelpers.buildFeeTransfer(new Output[](1)),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
+            uint64(block.timestamp),
+            [uint256(1), 2, 3, 4, 5, 6, 7, 8],
+            new GatewaySlot[](0)
+        );
+
+        assertEq(pool.treeRoot(0), 1002, "Root should be updated to 1002");
+    }
+
+    function test_epochUsesCurrentRootForActiveRootWhenSparseRootIsHistorical() public {
+        uint256 initialRoot = pool.treeRoot(0);
+
+        _submitBasicEpoch(
+            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, initialRoot), 0, 0, 1001, 2, false),
+            EpochHelpers.buildAuthRoots(0, 1)
+        );
+
+        uint256 currentRoot = pool.treeRoot(0);
+        ActiveRootAssertingVerifier assertingVerifier = new ActiveRootAssertingVerifier();
+        assertingVerifier.setExpectedActiveRoot(currentRoot);
+        pool.setEpochVerifier(address(assertingVerifier));
+
+        uint256[] memory nullifiers = new uint256[](1);
+        nullifiers[0] = 33334;
+
+        pool.submitEpoch(
+            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, initialRoot), 0, 2, 1002, 4, false),
+            EpochHelpers.buildAuthRoots(0, 1),
+            1,
+            1,
+            1,
+            EpochHelpers.singletonUint32Array(1),
+            EpochHelpers.singletonUint32Array(1),
+            EpochHelpers.wrap2D(nullifiers),
+            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
+            EpochHelpers.buildFeeTransfer(new Output[](1)),
+            new Withdrawal[](0),
+            new uint32[](0),
+            uint64(block.timestamp),
+            [uint256(1), 2, 3, 4, 5, 6, 7, 8],
+            new GatewaySlot[](0)
         );
 
         assertEq(pool.treeRoot(0), 1002, "Root should be updated to 1002");
@@ -330,13 +306,8 @@ contract SparseRootsEdgeCasesTest is Test {
         TreeRootPair[] memory roots = new TreeRootPair[](1);
         roots[0] = TreeRootPair({treeNumber: 0, root: 0}); // Zero root
 
-        uint256 currentRound = block.number / 300;
-
         vm.expectRevert(IPrivacyBoost.RootNotKnown.selector);
-        _submitBasicEpoch(
-            EpochHelpers.buildTreeState(roots, 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound)
-        );
+        _submitBasicEpoch(EpochHelpers.buildTreeState(roots, 0, 0, 1, 2, false), EpochHelpers.buildAuthRoots(0, 1));
     }
 
     /// @notice Test that zero root in usedAuthRoots reverts with RootNotKnown
@@ -344,7 +315,6 @@ contract SparseRootsEdgeCasesTest is Test {
         TreeRootPair[] memory authRoots = new TreeRootPair[](1);
         authRoots[0] = TreeRootPair({treeNumber: 0, root: 0}); // Zero root
 
-        uint256 currentRound = block.number / 300;
         uint256 currentTreeRoot = pool.treeRoot(0); // Read before expectRevert
 
         uint256[] memory nullifiers = new uint256[](1);
@@ -353,7 +323,7 @@ contract SparseRootsEdgeCasesTest is Test {
         vm.expectRevert(IPrivacyBoost.RootNotKnown.selector);
         pool.submitEpoch(
             EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, currentTreeRoot), 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(authRoots, currentRound),
+            authRoots,
             1, // nTransfers
             1, // feeTokenCount
             1, // feeNPK
@@ -364,101 +334,21 @@ contract SparseRootsEdgeCasesTest is Test {
             EpochHelpers.buildFeeTransfer(new Output[](1)),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
+            uint64(block.timestamp),
+            [uint256(1), 2, 3, 4, 5, 6, 7, 8],
+            new GatewaySlot[](0)
         );
-    }
-
-    // ========== Auth Snapshot Tests ==========
-
-    /// @notice Test that auth tree not snapshotted in non-current round reverts
-    function test_revert_authTreeNotSnapshotted() public {
-        uint256 currentRound = block.number / 300;
-
-        // Try to use previous round (currentRound - 1) without pre-snapshotted auth tree
-        // This should fail because the auth tree wasn't snapshotted in the previous round
-        if (currentRound > 0) {
-            uint256 previousRound = currentRound - 1;
-
-            vm.expectRevert(IPrivacyBoost.AuthTreeNotSnapshotted.selector);
-            _submitBasicEpoch(
-                EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, pool.treeRoot(0)), 0, 0, 1, 2, false),
-                EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), previousRound)
-            );
-        }
-    }
-
-    /// @notice Test lazy auth snapshot on current round succeeds
-    function test_lazyAuthSnapshotCurrentRound() public {
-        uint256 currentRound = block.number / 300;
-
-        // This should succeed because current round triggers lazy snapshot
-        _submitBasicEpoch(
-            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, pool.treeRoot(0)), 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound)
-        );
-
-        // Verify snapshot was taken
-        assertTrue(pool.authSnapshots(currentRound, 0) != 0, "Auth tree 0 should be snapshotted");
-    }
-
-    /// @notice Test that previous round works after snapshot was taken
-    function test_previousRoundWithSnapshot() public {
-        // Start at a round boundary for clarity
-        uint256 authInterval = pool.authSnapshotInterval();
-        vm.roll(authInterval); // Block 300
-        uint256 round0 = block.number / authInterval; // Round 1
-
-        uint256 treeRoot0 = pool.treeRoot(0);
-
-        // First, take a snapshot in current round (round 1)
-        _submitBasicEpoch(
-            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, treeRoot0), 0, 0, 1001, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), round0)
-        );
-
-        assertTrue(pool.authSnapshots(round0, 0) != 0, "Auth tree 0 should be snapshotted in round 0");
-
-        // Advance to next round
-        vm.roll(block.number + authInterval); // Block 600
-        uint256 round1 = block.number / authInterval; // Round 2
-        assertEq(round1, round0 + 1, "Should be in next round");
-
-        // Now previous round (round0) should work because we snapshotted it
-        uint256[] memory nullifiers = new uint256[](1);
-        nullifiers[0] = 123456789;
-
-        pool.submitEpoch(
-            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, 1001), 0, 2, 1002, 4, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), round0), // Previous round
-            1, // nTransfers
-            1, // feeTokenCount
-            1, // feeNPK
-            EpochHelpers.singletonUint32Array(1), // inputsPerTransfer
-            EpochHelpers.singletonUint32Array(1), // outputsPerTransfer
-            EpochHelpers.wrap2D(nullifiers),
-            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
-        );
-
-        assertEq(pool.treeRoot(0), 1002, "Root should be updated");
     }
 
     // ========== Multi-Tree Batch Tests ==========
 
     /// @notice Test multi-tree batch with partial sparse set
     function test_multiTreeBatchPartialSparseSet() public {
-        uint256 currentRound = block.number / 300;
-
         // First, submit to tree 0
         uint256 tree0Root = pool.treeRoot(0);
         _submitBasicEpoch(
             EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, tree0Root), 0, 0, 1001, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound)
+            EpochHelpers.buildAuthRoots(0, 1)
         );
 
         // Rollover to tree 1
@@ -479,8 +369,8 @@ contract SparseRootsEdgeCasesTest is Test {
         bytes32 baseArraySlot = keccak256(abi.encode(uint256(0), uint256(9)));
         vm.store(address(pool), bytes32(uint256(baseArraySlot) + 2), bytes32(fullTreeRoot));
 
-        // Epoch allows duplicate tree numbers in usedRoots: each transfer selects its digest root
-        // independently via digestRootIndices. The circuit uses findPairMatch (OR-based, safe with duplicates).
+        // Epoch allows duplicate tree numbers in usedRoots because each input
+        // proves membership against an explicit (treeNumber, root) pair.
         TreeRootPair[] memory multiRoots = new TreeRootPair[](2);
         multiRoots[0] = TreeRootPair({treeNumber: 0, root: fullTreeRoot});
         multiRoots[1] = TreeRootPair({treeNumber: 0, root: tree0Root}); // Duplicate tree number with different root (allowed for epoch)
@@ -491,7 +381,7 @@ contract SparseRootsEdgeCasesTest is Test {
         // Submit with rollover — duplicate tree numbers accepted for epoch
         pool.submitEpoch(
             EpochHelpers.buildTreeState(multiRoots, 0, MAX_LEAVES, 2001, 2, true),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound),
+            EpochHelpers.buildAuthRoots(0, 1),
             1, // nTransfers
             1, // feeTokenCount
             1, // feeNPK
@@ -502,22 +392,21 @@ contract SparseRootsEdgeCasesTest is Test {
             EpochHelpers.buildFeeTransfer(new Output[](1)),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
+            uint64(block.timestamp),
+            [uint256(1), 2, 3, 4, 5, 6, 7, 8],
+            new GatewaySlot[](0)
         );
     }
 
     /// @notice Test that epoch accepts duplicate tree numbers with different (but known) roots.
-    /// @dev Each transfer selects its digest root via digestRootIndices. The circuit uses
-    ///      findPairMatch (OR-based) which is safe with duplicate tree numbers.
+    /// @dev Inputs bind directly to (treeNumber, root) pairs, so duplicate tree numbers
+    ///      remain safe as long as exact duplicate pairs are rejected.
     function test_epochAcceptsDuplicateTreeNumberDifferentRoots() public {
-        uint256 currentRound = block.number / 300;
-
         // Submit once to make the initial root historical (known) and create a new current root.
         uint256 initialRoot = pool.treeRoot(0);
         _submitBasicEpoch(
             EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, initialRoot), 0, 0, 1001, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound)
+            EpochHelpers.buildAuthRoots(0, 1)
         );
 
         uint32 countOld = pool.treeCount(0);
@@ -530,16 +419,15 @@ contract SparseRootsEdgeCasesTest is Test {
         dupRoots[0] = TreeRootPair({treeNumber: 0, root: initialRoot});
         dupRoots[1] = TreeRootPair({treeNumber: 0, root: currentRoot});
 
-        // Epoch accepts duplicate tree numbers — each transfer selects its root via digestRootIndices
+        // Epoch accepts duplicate tree numbers with different known roots.
         _submitBasicEpoch(
             EpochHelpers.buildTreeState(dupRoots, 0, countOld, 2002, countOld + 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound)
+            EpochHelpers.buildAuthRoots(0, 1)
         );
     }
 
     /// @notice Test that epoch rejects exact duplicate (treeNumber, root) pairs.
     function test_revertWhen_epochDuplicateTreeRootPair() public {
-        uint256 currentRound = block.number / 300;
         uint256 root = pool.treeRoot(0);
 
         TreeRootPair[] memory dupPairs = new TreeRootPair[](2);
@@ -548,31 +436,23 @@ contract SparseRootsEdgeCasesTest is Test {
 
         vm.expectRevert(IPrivacyBoost.DuplicateTreeRootPair.selector);
         _submitBasicEpoch(
-            EpochHelpers.buildTreeState(dupPairs, 0, 0, 1001, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound)
+            EpochHelpers.buildTreeState(dupPairs, 0, 0, 1001, 2, false), EpochHelpers.buildAuthRoots(0, 1)
         );
     }
 
     /// @notice Test that duplicate tree numbers in usedAuthRoots are rejected.
     function test_revert_duplicateTreeNumberInUsedAuthRoots() public {
-        uint256 currentRound = block.number / 300;
-
         TreeRootPair[] memory usedRoots = EpochHelpers.buildUsedRoots(0, pool.treeRoot(0));
         TreeRootPair[] memory dupAuthRoots = new TreeRootPair[](2);
         dupAuthRoots[0] = TreeRootPair({treeNumber: 0, root: 1});
         dupAuthRoots[1] = TreeRootPair({treeNumber: 0, root: 1});
 
         vm.expectRevert(IPrivacyBoost.DuplicateTreeNumber.selector);
-        _submitBasicEpoch(
-            EpochHelpers.buildTreeState(usedRoots, 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(dupAuthRoots, currentRound)
-        );
+        _submitBasicEpoch(EpochHelpers.buildTreeState(usedRoots, 0, 0, 1, 2, false), dupAuthRoots);
     }
 
     /// @notice Test epoch with inputs from historical tree (after rollover)
     function test_epochWithHistoricalTreeInputs() public {
-        uint256 currentRound = block.number / 300;
-
         // Set up tree 0 at max capacity and do rollover
         uint8 MERKLE_DEPTH = 20;
         uint32 MAX_LEAVES = uint32(1 << MERKLE_DEPTH);
@@ -598,7 +478,7 @@ contract SparseRootsEdgeCasesTest is Test {
             EpochHelpers.buildTreeState(
                 EpochHelpers.buildUsedRoots(0, tree0FinalRoot), 0, MAX_LEAVES, 0xEEE10001, 2, true
             ),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound),
+            EpochHelpers.buildAuthRoots(0, 1),
             1, // nTransfers
             1, // feeTokenCount
             1, // feeNPK
@@ -609,8 +489,9 @@ contract SparseRootsEdgeCasesTest is Test {
             EpochHelpers.buildFeeTransfer(new Output[](1)),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
+            uint64(block.timestamp),
+            [uint256(1), 2, 3, 4, 5, 6, 7, 8],
+            new GatewaySlot[](0)
         );
 
         assertEq(pool.currentTreeNumber(), 1, "Should be on tree 1");
@@ -624,7 +505,7 @@ contract SparseRootsEdgeCasesTest is Test {
 
         pool.submitEpoch(
             EpochHelpers.buildTreeState(multiRoots, 1, 2, 0xEEE10002, 4, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound),
+            EpochHelpers.buildAuthRoots(0, 1),
             1, // nTransfers
             1, // feeTokenCount
             1, // feeNPK
@@ -635,80 +516,18 @@ contract SparseRootsEdgeCasesTest is Test {
             EpochHelpers.buildFeeTransfer(new Output[](1)),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
+            uint64(block.timestamp),
+            [uint256(1), 2, 3, 4, 5, 6, 7, 8],
+            new GatewaySlot[](0)
         );
 
         assertEq(pool.treeRoot(1), 0xEEE10002, "Tree 1 root should be updated");
-    }
-
-    // ========== Invalid Auth Snapshot Round Tests ==========
-
-    /// @notice Test that far future auth snapshot round reverts
-    function test_revert_futurAuthSnapshotRound() public {
-        uint256 currentRound = block.number / 300;
-        uint256 futureRound = currentRound + 100; // Far in the future
-        uint256 currentTreeRoot = pool.treeRoot(0); // Read before expectRevert
-
-        uint256[] memory nullifiers = new uint256[](1);
-        nullifiers[0] = uint256(keccak256(abi.encodePacked(block.timestamp, uint256(1))));
-
-        vm.expectRevert(IPrivacyBoost.InvalidAuthSnapshotRound.selector);
-        pool.submitEpoch(
-            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, currentTreeRoot), 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), futureRound),
-            1, // nTransfers
-            1, // feeTokenCount
-            1, // feeNPK
-            EpochHelpers.singletonUint32Array(1), // inputsPerTransfer
-            EpochHelpers.singletonUint32Array(1), // outputsPerTransfer
-            EpochHelpers.wrap2D(nullifiers),
-            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
-        );
-    }
-
-    /// @notice Test that too old auth snapshot round reverts
-    function test_revert_tooOldAuthSnapshotRound() public {
-        // Advance several rounds
-        vm.roll(block.number + 3000); // Advance 10 rounds
-
-        uint256 currentRound = block.number / 300;
-        uint256 oldRound = currentRound - 5; // Too old
-        uint256 currentTreeRoot = pool.treeRoot(0); // Read before expectRevert
-
-        uint256[] memory nullifiers = new uint256[](1);
-        nullifiers[0] = uint256(keccak256(abi.encodePacked(block.timestamp, uint256(1))));
-
-        vm.expectRevert(IPrivacyBoost.InvalidAuthSnapshotRound.selector);
-        pool.submitEpoch(
-            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, currentTreeRoot), 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), oldRound),
-            1, // nTransfers
-            1, // feeTokenCount
-            1, // feeNPK
-            EpochHelpers.singletonUint32Array(1), // inputsPerTransfer
-            EpochHelpers.singletonUint32Array(1), // outputsPerTransfer
-            EpochHelpers.wrap2D(nullifiers),
-            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
-        );
     }
 
     // ========== Multi-Auth Tree Tests ==========
 
     /// @notice Test epoch with multiple auth trees in sparse array
     function test_multipleAuthTreesInSparseArray() public {
-        uint256 currentRound = block.number / 300;
-
         // Add more auth trees via mock
         authRegistry.addAuthTree(2); // Tree 1 with root 2
         authRegistry.addAuthTree(3); // Tree 2 with root 3
@@ -725,7 +544,7 @@ contract SparseRootsEdgeCasesTest is Test {
 
         pool.submitEpoch(
             EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, pool.treeRoot(0)), 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(multiAuthRoots, currentRound),
+            multiAuthRoots,
             1, // nTransfers
             1, // feeTokenCount
             1, // feeNPK
@@ -736,44 +555,31 @@ contract SparseRootsEdgeCasesTest is Test {
             EpochHelpers.buildFeeTransfer(new Output[](1)),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
+            uint64(block.timestamp),
+            [uint256(1), 2, 3, 4, 5, 6, 7, 8],
+            new GatewaySlot[](0)
         );
 
-        // All three trees should be snapshotted
-        assertTrue(pool.authSnapshots(currentRound, 0) != 0, "Auth tree 0 should be snapshotted");
-        assertTrue(pool.authSnapshots(currentRound, 1) != 0, "Auth tree 1 should be snapshotted");
-        assertTrue(pool.authSnapshots(currentRound, 2) != 0, "Auth tree 2 should be snapshotted");
+        assertEq(pool.treeRoot(0), 1, "Root should be updated");
     }
 
-    /// @notice Test that partial auth snapshot (some trees snapshotted, others not) reverts for non-current round
-    function test_revert_partialAuthSnapshotNonCurrentRound() public {
-        uint256 currentRound = block.number / 300;
-
-        // First, snapshot only tree 0 in current round
-        _submitBasicEpoch(
-            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, pool.treeRoot(0)), 0, 0, 1001, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound)
-        );
-
-        // Advance to next round
-        vm.roll(block.number + 300);
-
+    /// @notice Test that an unknown auth root for an extra tree reverts.
+    function test_revert_unknownAuthRootForExtraTree() public {
         // Add auth tree 1
         authRegistry.addAuthTree(2);
 
-        // Try to use previous round with auth tree 1 (which wasn't snapshotted)
         TreeRootPair[] memory multiAuthRoots = new TreeRootPair[](2);
         multiAuthRoots[0] = TreeRootPair({treeNumber: 0, root: 1});
-        multiAuthRoots[1] = TreeRootPair({treeNumber: 1, root: 2}); // Not snapshotted in previous round
+        multiAuthRoots[1] = TreeRootPair({treeNumber: 1, root: 9999}); // Not the known root for tree 1
 
+        uint256 currentTreeRoot = pool.treeRoot(0); // Read before expectRevert
         uint256[] memory nullifiers = new uint256[](1);
         nullifiers[0] = 44444;
 
-        vm.expectRevert(IPrivacyBoost.AuthTreeNotSnapshotted.selector);
+        vm.expectRevert(IPrivacyBoost.RootNotKnown.selector);
         pool.submitEpoch(
-            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, 1001), 0, 2, 1002, 4, false),
-            EpochHelpers.buildAuthState(multiAuthRoots, currentRound), // Previous round
+            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, currentTreeRoot), 0, 0, 1, 2, false),
+            multiAuthRoots,
             1, // nTransfers
             1, // feeTokenCount
             1, // feeNPK
@@ -784,8 +590,9 @@ contract SparseRootsEdgeCasesTest is Test {
             EpochHelpers.buildFeeTransfer(new Output[](1)),
             new Withdrawal[](0),
             new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
+            uint64(block.timestamp),
+            [uint256(1), 2, 3, 4, 5, 6, 7, 8],
+            new GatewaySlot[](0)
         );
     }
 
@@ -826,293 +633,6 @@ contract SparseRootsEdgeCasesTest is Test {
             new Output[](1),
             new DepositEntry[](0),
             [uint256(1), 2, 3, 4, 5, 6, 7, 8]
-        );
-    }
-
-    // ========== Digest Root Indices Tests ==========
-
-    /// @notice Test that submitEpoch reverts when digestRootIndices is too short for nTransfers.
-    function test_revertWhen_digestRootIndicesTooShort() public {
-        uint256 currentRound = block.number / 300;
-        uint256 root = pool.treeRoot(0);
-
-        // Empty digestRootIndices with 1 transfer should revert
-        uint256[] memory emptyIndices = new uint256[](0);
-
-        vm.expectRevert(IPrivacyBoost.InvalidArrayLengths.selector);
-        pool.submitEpoch(
-            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, root), 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound),
-            1, // nTransfers
-            1, // feeTokenCount
-            1, // feeNPK
-            EpochHelpers.singletonUint32Array(1),
-            EpochHelpers.singletonUint32Array(1),
-            EpochHelpers.wrap2D(new uint256[](1)),
-            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            emptyIndices,
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
-        );
-    }
-
-    /// @notice Test that submitEpoch reverts when a digestRootIndex points beyond usedRoots.
-    function test_revertWhen_digestRootIndexOutOfBounds() public {
-        uint256 currentRound = block.number / 300;
-        uint256 root = pool.treeRoot(0);
-
-        // Index 1 is out of bounds when usedRoots has only 1 element
-        uint256[] memory badIndices = new uint256[](1);
-        badIndices[0] = 1; // 4-bit index = 1, but usedRoots.length = 1
-
-        vm.expectRevert(IPrivacyBoost.InvalidBatchConfig.selector);
-        pool.submitEpoch(
-            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, root), 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound),
-            1, // nTransfers
-            1, // feeTokenCount
-            1, // feeNPK
-            EpochHelpers.singletonUint32Array(1),
-            EpochHelpers.singletonUint32Array(1),
-            EpochHelpers.wrap2D(new uint256[](1)),
-            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            badIndices,
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
-        );
-    }
-
-    /// @notice Test that digestRootIndices pointing to slot 1 works when usedRoots has 2 entries.
-    function test_digestRootIndexPointsToNonZeroSlot() public {
-        uint256 currentRound = block.number / 300;
-
-        // Submit a basic epoch to create a historical root and advance the tree.
-        uint256 initialRoot = pool.treeRoot(0);
-        _submitBasicEpoch(
-            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, initialRoot), 0, 0, 1001, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound)
-        );
-
-        uint32 countAfter = pool.treeCount(0);
-        uint256 currentRoot = pool.treeRoot(0);
-
-        // usedRoots[0] = (tree0, initialRoot), usedRoots[1] = (tree0, currentRoot)
-        TreeRootPair[] memory roots = new TreeRootPair[](2);
-        roots[0] = TreeRootPair({treeNumber: 0, root: initialRoot});
-        roots[1] = TreeRootPair({treeNumber: 0, root: currentRoot});
-
-        // digestRootIndices[0] = 1 → transfer 0 uses slot 1 (currentRoot), not slot 0
-        uint256[] memory indices = new uint256[](1);
-        indices[0] = 1;
-
-        uint256[] memory nullifiers = new uint256[](1);
-        nullifiers[0] = uint256(keccak256(abi.encodePacked(block.timestamp, currentRoot, uint256(2))));
-
-        pool.submitEpoch(
-            EpochHelpers.buildTreeState(roots, 0, countAfter, 2001, countAfter + 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound),
-            1,
-            1,
-            1,
-            EpochHelpers.singletonUint32Array(1),
-            EpochHelpers.singletonUint32Array(1),
-            EpochHelpers.wrap2D(nullifiers),
-            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            indices,
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
-        );
-    }
-
-    /// @notice Test that digestRootIndices array longer than needed is rejected (canonical encoding).
-    function test_digestRootIndicesExtraWordsIgnored() public {
-        uint256 currentRound = block.number / 300;
-        uint256 root = pool.treeRoot(0);
-
-        // 3 words for 1 transfer (only 1 word needed) — extra words are non-canonical
-        uint256[] memory indices = new uint256[](3);
-        indices[0] = 0;
-        indices[1] = 0xDEAD; // garbage in extra word
-        indices[2] = 0xBEEF; // garbage in extra word
-
-        uint256[] memory nullifiers = new uint256[](1);
-        nullifiers[0] = uint256(keccak256(abi.encodePacked(block.timestamp, root, uint256(999))));
-
-        vm.expectRevert(IPrivacyBoost.InvalidArrayLengths.selector);
-        pool.submitEpoch(
-            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, root), 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound),
-            1,
-            1,
-            1,
-            EpochHelpers.singletonUint32Array(1),
-            EpochHelpers.singletonUint32Array(1),
-            EpochHelpers.wrap2D(nullifiers),
-            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            indices,
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
-        );
-    }
-
-    /// @notice Test digestRootIndices extraction across uint256 word boundary (transfer 63 in word 0, transfer 64 in word 1).
-    /// @dev Deploys a separate pool with batchSize=65 to exercise the t/64 word index and (t%64)*4 bit offset logic.
-    function test_digestRootIndicesWordBoundary() public {
-        // Deploy pool with batchSize=65 to cross the 64-transfer word boundary
-        MockVerifier v = new MockVerifier();
-        MockAuthRegistryMultiTree ar = new MockAuthRegistryMultiTree();
-        DeployConfig memory cfg = PoolDeployer.defaultConfig(owner, proxyAdmin, address(v));
-        cfg.batchSize = 65;
-        cfg.maxFeeTokens = 1;
-        (PrivacyBoost pool65,) = PoolDeployer.deployWithMockAuth(cfg, address(ar));
-        pool65.setOperator(operator);
-        address[] memory relays = new address[](1);
-        relays[0] = address(this);
-        vm.prank(operator);
-        pool65.setAllowedRelays(relays, true);
-
-        uint256 currentRound = block.number / 300;
-        uint256 initialRoot = pool65.treeRoot(0);
-
-        // Create a second known root so slot 1 can be used.
-        // After this, (treeNumber=0, initialRoot) remains known via the ring buffer, and the new root is the current root.
-        {
-            uint256[] memory nullifiers1 = new uint256[](1);
-            nullifiers1[0] = 999_999;
-
-            pool65.submitEpoch(
-                EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, initialRoot), 0, 0, 6001, 2, false),
-                EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound),
-                1, // nTransfers
-                1, // feeTokenCount
-                1, // feeNPK
-                EpochHelpers.singletonUint32Array(1), // inputsPerTransfer
-                EpochHelpers.singletonUint32Array(1), // outputsPerTransfer
-                EpochHelpers.wrap2D(nullifiers1),
-                EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-                EpochHelpers.buildFeeTransfer(new Output[](1)),
-                new Withdrawal[](0),
-                new uint32[](0),
-                EpochHelpers.defaultDigestRootIndices(),
-                EpochHelpers.dummyProof()
-            );
-        }
-
-        uint256 currentRoot = pool65.treeRoot(0);
-        uint32 countOld = pool65.treeCount(0);
-
-        // Build 65-element arrays
-        uint32[] memory inputs = new uint32[](65);
-        uint32[] memory outputs = new uint32[](65);
-        uint256[][] memory nulls = new uint256[][](65);
-        Transfer[] memory txs = new Transfer[](65);
-        for (uint256 i = 0; i < 65; i++) {
-            inputs[i] = 1;
-            outputs[i] = 1;
-            nulls[i] = new uint256[](1);
-            nulls[i][0] = i + 1; // unique nullifiers
-            Output[] memory outs = new Output[](1);
-            outs[0] = EpochHelpers.makeOutput(7001 + i);
-            txs[i] = Transfer({viewingKey: bytes32(0), teeWrapKey: bytes32(0), outputs: outs});
-        }
-
-        // 2 usedRoots so index 1 is valid
-        TreeRootPair[] memory roots = new TreeRootPair[](2);
-        roots[0] = TreeRootPair({treeNumber: 0, root: initialRoot});
-        roots[1] = TreeRootPair({treeNumber: 0, root: currentRoot});
-
-        // Word 0: transfers 0-63 → slot 0 (all zeros)
-        // Word 1: transfer 64 → slot 1 (value 1 in bits 0-3)
-        uint256[] memory indices = new uint256[](2);
-        indices[0] = 0;
-        indices[1] = 1;
-
-        pool65.submitEpoch(
-            EpochHelpers.buildTreeState(roots, 0, countOld, 1, countOld + uint32(66), false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound),
-            65,
-            1,
-            1,
-            inputs,
-            outputs,
-            nulls,
-            txs,
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            indices,
-            EpochHelpers.dummyProof()
-        );
-    }
-
-    /// @notice Test that an out-of-bounds index in word 1 (for transfer 64) correctly reverts.
-    /// @dev Proves the contract reads from word 1 (not word 0) for transfer 64.
-    ///      If there were an off-by-one bug reading word 0 instead, index 0 would be extracted
-    ///      (valid), and the test would fail because no revert occurs.
-    function test_revertWhen_digestRootIndexOutOfBoundsAtWordBoundary() public {
-        MockVerifier v = new MockVerifier();
-        MockAuthRegistryMultiTree ar = new MockAuthRegistryMultiTree();
-        DeployConfig memory cfg = PoolDeployer.defaultConfig(owner, proxyAdmin, address(v));
-        cfg.batchSize = 65;
-        cfg.maxFeeTokens = 1;
-        (PrivacyBoost pool65,) = PoolDeployer.deployWithMockAuth(cfg, address(ar));
-        pool65.setOperator(operator);
-        address[] memory relays = new address[](1);
-        relays[0] = address(this);
-        vm.prank(operator);
-        pool65.setAllowedRelays(relays, true);
-
-        uint256 currentRound = block.number / 300;
-        uint256 root = pool65.treeRoot(0);
-
-        uint32[] memory inputs = new uint32[](65);
-        uint32[] memory outputs = new uint32[](65);
-        uint256[][] memory nulls = new uint256[][](65);
-        Transfer[] memory txs = new Transfer[](65);
-        for (uint256 i = 0; i < 65; i++) {
-            inputs[i] = 1;
-            outputs[i] = 1;
-            nulls[i] = new uint256[](1);
-            nulls[i][0] = i + 1;
-            Output[] memory outs = new Output[](1);
-            outs[0] = EpochHelpers.makeOutput(8001 + i);
-            txs[i] = Transfer({viewingKey: bytes32(0), teeWrapKey: bytes32(0), outputs: outs});
-        }
-
-        // Only 1 usedRoot, so index 2 is out of bounds
-        TreeRootPair[] memory roots = new TreeRootPair[](1);
-        roots[0] = TreeRootPair({treeNumber: 0, root: root});
-
-        // Word 0: all zeros (valid index 0 for transfers 0-63)
-        // Word 1: index 2 for transfer 64 → out of bounds (usedRoots.length = 1)
-        uint256[] memory indices = new uint256[](2);
-        indices[0] = 0;
-        indices[1] = 2;
-
-        vm.expectRevert(IPrivacyBoost.InvalidBatchConfig.selector);
-        pool65.submitEpoch(
-            EpochHelpers.buildTreeState(roots, 0, 0, 1, 66, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), currentRound),
-            65,
-            1,
-            1,
-            inputs,
-            outputs,
-            nulls,
-            txs,
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            indices,
-            EpochHelpers.dummyProof()
         );
     }
 
