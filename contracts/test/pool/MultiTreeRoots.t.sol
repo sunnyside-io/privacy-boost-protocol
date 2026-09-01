@@ -20,14 +20,7 @@ import {Test} from "forge-std/Test.sol";
 import {PrivacyBoost} from "src/PrivacyBoost.sol";
 import {IPrivacyBoost} from "src/interfaces/IPrivacyBoost.sol";
 import {TokenRegistry} from "src/TokenRegistry.sol";
-import {
-    Output,
-    Transfer,
-    Withdrawal,
-    EpochTreeState,
-    AuthSnapshotState,
-    TreeRootPair
-} from "src/interfaces/IStructs.sol";
+import {Output, Transfer, Withdrawal, EpochTreeState, TreeRootPair, GatewaySlot} from "src/interfaces/IStructs.sol";
 import {MockVerifier, MockAuthRegistry} from "test/helpers/Mocks.sol";
 import {PoolDeployer, DeployConfig} from "test/helpers/PoolDeployer.sol";
 import {EpochHelpers} from "test/helpers/EpochHelpers.sol";
@@ -52,6 +45,27 @@ contract MultiTreeRootsTest is Test {
         cfg.maxForcedInputs = 1;
         (pool, tokenRegistry) = PoolDeployer.deployWithMockAuth(cfg, address(authRegistry));
         pool.setOperator(operator);
+    }
+
+    /// @dev Submit a basic single-transfer epoch with auth root (treeNumber 0, root 1) known to MockAuthRegistry.
+    function _submitBasicEpoch(EpochTreeState memory treeState, uint256[] memory nullifiers) internal {
+        pool.submitEpoch(
+            treeState,
+            EpochHelpers.buildAuthRoots(0, 1),
+            1, // nTransfers
+            1, // feeTokenCount
+            1, // feeNPK
+            EpochHelpers.singletonUint32Array(1), // inputsPerTransfer
+            EpochHelpers.singletonUint32Array(1), // outputsPerTransfer
+            EpochHelpers.wrap2D(nullifiers),
+            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
+            EpochHelpers.buildFeeTransfer(new Output[](1)),
+            new Withdrawal[](0),
+            new uint32[](0),
+            uint64(block.timestamp),
+            [uint256(1), 2, 3, 4, 5, 6, 7, 8],
+            new GatewaySlot[](0)
+        );
     }
 
     /// @notice Test initial multi-tree state
@@ -116,22 +130,7 @@ contract MultiTreeRootsTest is Test {
 
         // This should revert because tree 1 root is not known
         vm.expectRevert(IPrivacyBoost.RootNotKnown.selector);
-        pool.submitEpoch(
-            EpochHelpers.buildTreeState(usedRoots, 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
-            1, // nTransfers
-            1, // feeTokenCount
-            1, // feeNPK
-            EpochHelpers.singletonUint32Array(1), // inputsPerTransfer
-            EpochHelpers.singletonUint32Array(1), // outputsPerTransfer
-            EpochHelpers.wrap2D(nullifiers),
-            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
-        );
+        _submitBasicEpoch(EpochHelpers.buildTreeState(usedRoots, 0, 0, 1, 2, false), nullifiers);
     }
 
     /// @notice Test that valid usedRoots with only active tree passes the root validation
@@ -147,21 +146,8 @@ contract MultiTreeRootsTest is Test {
         nullifiers[0] = 1;
 
         // With MockVerifier returning true, this should succeed entirely
-        pool.submitEpoch(
-            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, pool.treeRoot(0)), 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
-            1, // nTransfers
-            1, // feeTokenCount
-            1, // feeNPK
-            EpochHelpers.singletonUint32Array(1), // inputsPerTransfer
-            EpochHelpers.singletonUint32Array(1), // outputsPerTransfer
-            EpochHelpers.wrap2D(nullifiers),
-            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
+        _submitBasicEpoch(
+            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, pool.treeRoot(0)), 0, 0, 1, 2, false), nullifiers
         );
 
         // Verify state was updated (proof that tx succeeded)
@@ -184,21 +170,8 @@ contract MultiTreeRootsTest is Test {
         vm.expectEmit(true, true, true, true);
         emit IPrivacyBoost.EpochSubmitted(0, 1, 0, 2);
 
-        pool.submitEpoch(
-            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, pool.treeRoot(0)), 0, 0, 1, 2, false),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
-            1, // nTransfers
-            1, // feeTokenCount
-            1, // feeNPK
-            EpochHelpers.singletonUint32Array(1), // inputsPerTransfer
-            EpochHelpers.singletonUint32Array(1), // outputsPerTransfer
-            EpochHelpers.wrap2D(nullifiers),
-            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
+        _submitBasicEpoch(
+            EpochHelpers.buildTreeState(EpochHelpers.buildUsedRoots(0, pool.treeRoot(0)), 0, 0, 1, 2, false), nullifiers
         );
     }
 
@@ -214,7 +187,7 @@ contract MultiTreeRootsTest is Test {
 
         // Set up tree at max capacity using vm.store
         // Storage layout: treeRoot=slot7, treeCount=slot8, treeRootHistory=slot9, treeRootHistoryCursor=slot10
-        // (slots shifted by 1 after operator was added)
+        // (slots shifted by 1 after operator was added; giftClaimVerifier is appended at the end so it does not shift these)
         uint8 MERKLE_DEPTH = 20;
         uint32 MAX_LEAVES = uint32(1 << MERKLE_DEPTH);
 
@@ -254,23 +227,11 @@ contract MultiTreeRootsTest is Test {
         vm.expectEmit(true, true, true, true);
         emit IPrivacyBoost.EpochSubmitted(1, newRoot, 0, newCount);
 
-        pool.submitEpoch(
+        _submitBasicEpoch(
             EpochHelpers.buildTreeState(
                 EpochHelpers.buildUsedRoots(0, fullTreeRoot), 0, MAX_LEAVES, newRoot, newCount, true
             ),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
-            1, // nTransfers
-            1, // feeTokenCount
-            1, // feeNPK
-            EpochHelpers.singletonUint32Array(1), // inputsPerTransfer
-            EpochHelpers.singletonUint32Array(1), // outputsPerTransfer
-            EpochHelpers.wrap2D(nullifiers),
-            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
+            nullifiers
         );
 
         // Verify tree advanced
@@ -309,23 +270,11 @@ contract MultiTreeRootsTest is Test {
         nullifiers[0] = 6001;
 
         // Do rollover to advance to tree 1
-        pool.submitEpoch(
+        _submitBasicEpoch(
             EpochHelpers.buildTreeState(
                 EpochHelpers.buildUsedRoots(0, tree0FinalRoot), 0, MAX_LEAVES, 0xEEE10001, 2, true
             ),
-            EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
-            1, // nTransfers
-            1, // feeTokenCount
-            1, // feeNPK
-            EpochHelpers.singletonUint32Array(1), // inputsPerTransfer
-            EpochHelpers.singletonUint32Array(1), // outputsPerTransfer
-            EpochHelpers.wrap2D(nullifiers),
-            EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-            EpochHelpers.buildFeeTransfer(new Output[](1)),
-            new Withdrawal[](0),
-            new uint32[](0),
-            EpochHelpers.defaultDigestRootIndices(),
-            [uint256(1), 2, 3, 4, 5, 6, 7, 8]
+            nullifiers
         );
 
         // Now tree 0 is finalized
@@ -347,32 +296,20 @@ contract MultiTreeRootsTest is Test {
         vm.prank(operator);
         pool.setAllowedRelays(relays, true);
 
-        // Submit 65 epochs to fill history (ROOT_HISTORY_SIZE = 64)
-        // First root will be evicted after 65th submission
-        for (uint256 i = 0; i < 65; i++) {
+        // Submit 129 epochs to fill history (ROOT_HISTORY_SIZE = 128)
+        // First root will be evicted after the 129th submission
+        for (uint256 i = 0; i < 129; i++) {
             uint256[] memory nullifiers = new uint256[](1);
             nullifiers[0] = 10000 + i;
 
             uint256 newRoot = 0x1000000 + i;
             uint32 countOld = pool.treeCount(0);
 
-            pool.submitEpoch(
+            _submitBasicEpoch(
                 EpochHelpers.buildTreeState(
                     EpochHelpers.buildUsedRoots(0, pool.treeRoot(0)), 0, countOld, newRoot, countOld + 2, false
                 ),
-                EpochHelpers.buildAuthState(EpochHelpers.buildAuthRoots(0, 1), 0),
-                1, // nTransfers
-                1, // feeTokenCount
-                1, // feeNPK
-                EpochHelpers.singletonUint32Array(1), // inputsPerTransfer
-                EpochHelpers.singletonUint32Array(1), // outputsPerTransfer
-                EpochHelpers.wrap2D(nullifiers),
-                EpochHelpers.buildTransfers(EpochHelpers.defaultOutputs(1)),
-                EpochHelpers.buildFeeTransfer(new Output[](1)),
-                new Withdrawal[](0),
-                new uint32[](0),
-                EpochHelpers.defaultDigestRootIndices(),
-                [uint256(1), 2, 3, 4, 5, 6, 7, 8]
+                nullifiers
             );
         }
 
@@ -381,7 +318,7 @@ contract MultiTreeRootsTest is Test {
         assertFalse(pool.isKnownTreeRoot(0, evictedRoot), "Evicted root should not be known");
 
         // Recent roots should still be known
-        uint256 recentRoot = 0x1000000 + 64;
+        uint256 recentRoot = 0x1000000 + 128;
         assertTrue(pool.isKnownTreeRoot(0, recentRoot), "Recent root should be known");
     }
 }

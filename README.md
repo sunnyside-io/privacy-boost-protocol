@@ -28,8 +28,12 @@ contracts/
     PrivacyBoost.sol        Core shielded pool
     AuthRegistry.sol        EdDSA key registry
     TokenRegistry.sol       Token ID mapping
+    PortalDelegate.sol      EIP-7702 delegate for portal deposit addresses
+    gateway/                External call gateway
     verifier/               Groth16 proof verifiers
-    lib/                    Merkle tree, Poseidon2, BabyJubJub
+    hash/                   Poseidon2 and authorization-tree hashing
+    interfaces/             Shared types, constants and contract interfaces
+    lib/                    Epoch, deposit, portal, gift, digest and BabyJubJub libraries
 
 frontend/
     epoch_circuit.go        Batched transfer & withdrawal circuit

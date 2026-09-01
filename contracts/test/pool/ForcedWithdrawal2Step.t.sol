@@ -1,19 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-/*
- * Copyright (c) 2026 Sunnyside Labs Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 pragma solidity 0.8.34;
 
 import {Test} from "forge-std/Test.sol";
@@ -22,9 +7,8 @@ import {PrivacyBoost} from "src/PrivacyBoost.sol";
 import {IPrivacyBoost} from "src/interfaces/IPrivacyBoost.sol";
 import {TokenRegistry} from "src/TokenRegistry.sol";
 import {AuthRegistry} from "src/AuthRegistry.sol";
-import {Withdrawal, ForcedWithdrawalRequest, AuthSnapshotState, TreeRootPair} from "src/interfaces/IStructs.sol";
+import {Withdrawal, TreeRootPair} from "src/interfaces/IStructs.sol";
 import {TOKEN_TYPE_ERC20} from "src/interfaces/Constants.sol";
-import {console} from "forge-std/console.sol";
 
 import {MockERC20, MockVerifier} from "test/helpers/Mocks.sol";
 import {PoolDeployer, DeployConfig} from "test/helpers/PoolDeployer.sol";
@@ -34,1225 +18,487 @@ contract ForcedWithdrawal2StepTest is Test {
     PrivacyBoost pool;
     TokenRegistry tokenRegistry;
     AuthRegistry authRegistry;
-    MockVerifier verifier;
     MockERC20 token;
 
-    address owner = address(this);
-    address proxyAdmin = address(0xAD); // Separate proxy admin to avoid TransparentProxy routing issue
+    address constant PROXY_ADMIN = address(0xAD);
     address alice = makeAddr("alice");
-    address relay = makeAddr("relay");
-    address operator = makeAddr("operator");
+    address bob = makeAddr("bob");
+    address keeper = makeAddr("keeper");
+    address treasury = makeAddr("treasury");
 
     uint16 tokenId;
+    uint256 accountId;
+    bytes32 authId;
+    uint256 approvalBatchRoot;
+    uint64 authExpiry;
+    uint256 noteRoot;
+
     uint96 constant AMOUNT = 1000 ether;
-    uint256 constant AUTH_SNAPSHOT_INTERVAL = 300;
+    uint16 constant FEE_BPS = 200;
+    uint256 constant APPROVAL_COMMITMENT = 123456789;
+    bytes32 private constant REQUEST_KEY_DOMAIN = keccak256("PB:FORCED_REQUEST_KEY:SNAPSHOT:v1");
 
     function setUp() public {
-        verifier = new MockVerifier();
-
-        DeployConfig memory cfg = PoolDeployer.defaultConfig(owner, proxyAdmin, address(verifier));
+        MockVerifier verifier = new MockVerifier();
+        DeployConfig memory cfg = PoolDeployer.defaultConfig(address(this), PROXY_ADMIN, address(verifier));
         (pool, tokenRegistry, authRegistry) = PoolDeployer.deployFullStack(cfg);
 
         token = new MockERC20();
         tokenId = tokenRegistry.register(TOKEN_TYPE_ERC20, address(token), 0);
-
-        // Fund the pool (simulating private deposits)
         token.mint(address(pool), 100_000 ether);
+        noteRoot = pool.treeRoot(0);
 
-        // Set operator
-        pool.setOperator(operator);
+        vm.prank(alice);
+        accountId = authRegistry.createAccount(123);
+        authExpiry = uint64(block.timestamp + 1 days);
+        vm.prank(alice);
+        authRegistry.approveSpend(accountId, APPROVAL_COMMITMENT, authExpiry);
 
-        // Setup relay
-        address[] memory relays = new address[](1);
-        relays[0] = relay;
-        vm.prank(operator);
-        pool.setAllowedRelays(relays, true);
-
-        // Establish an initial snapshot for the current round so permissionless forced withdrawals
-        // can validate against an existing snapshot (requestForcedWithdrawal must not create snapshots).
-        uint256[] memory treeNums = new uint256[](1);
-        treeNums[0] = 0;
-        vm.prank(relay);
-        pool.snapshotAuthTrees(treeNums);
+        uint256[] memory batch = new uint256[](1);
+        batch[0] = APPROVAL_COMMITMENT;
+        approvalBatchRoot = authRegistry.computeSpendApprovalBatchRoot(batch);
+        authId = authRegistry.computeSpendApprovalBatchId(accountId, approvalBatchRoot);
     }
 
-    function _toArrays(uint256 nullifier, uint256 commitment)
+    function _authContext() internal view returns (uint128) {
+        return uint128(authExpiry) | (uint128(1) << 64) | (uint128(1) << 100);
+    }
+
+    function _authContext(uint64 expiry, uint8 mode, uint32 leafIndex, uint16 treeNumber)
+        internal
+        pure
+        returns (uint128)
+    {
+        return uint128(expiry) | (uint128(mode) << 64) | (uint128(leafIndex) << 65) | (uint128(treeNumber) << 85)
+            | (uint128(1) << 100);
+    }
+
+    function _roots() internal view returns (TreeRootPair[] memory roots) {
+        roots = EpochHelpers.buildUsedRoots(0, noteRoot);
+    }
+
+    function _arrays(uint256 nullifier, uint256 commitment)
         internal
         pure
         returns (uint256[] memory nullifiers, uint256[] memory commitments)
     {
         nullifiers = new uint256[](1);
-        nullifiers[0] = nullifier;
         commitments = new uint256[](1);
+        nullifiers[0] = nullifier;
         commitments[0] = commitment;
     }
 
-    function _getRequestKey(address requester, uint256[] memory commitments) internal pure returns (uint256) {
-        bytes32 commitmentsHash = keccak256(abi.encodePacked(commitments));
-        return uint256(keccak256(abi.encodePacked(requester, commitmentsHash)));
+    function _request(address submitter, uint256[] memory nullifiers, uint256[] memory commitments) internal {
+        _requestWithAuthorization(submitter, accountId, _authContext(), authId, nullifiers, commitments);
     }
 
-    function _makeWithdrawal(address to, uint16 tid, uint96 amt) internal pure returns (Withdrawal memory) {
-        return Withdrawal({to: to, tokenId: tid, amount: amt});
-    }
-
-    function _getAuthRoots() internal view returns (TreeRootPair[] memory) {
-        TreeRootPair[] memory roots = new TreeRootPair[](1);
-        roots[0] = TreeRootPair({treeNumber: 0, root: authRegistry.authTreeRoot(0)});
-        return roots;
-    }
-
-    function _snapshotTree0ForCurrentRound() internal {
-        uint256[] memory treeNums = new uint256[](1);
-        treeNums[0] = 0;
-        vm.prank(relay);
-        pool.snapshotAuthTrees(treeNums);
-    }
-
-    // ========== Step 1: Request ==========
-
-    function test_requestForcedWithdrawal() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        vm.prank(alice);
+    function _requestWithAuthorization(
+        address submitter,
+        uint256 requestAccountId,
+        uint128 requestAuthContext,
+        bytes32 requestAuthId,
+        uint256[] memory nullifiers,
+        uint256[] memory commitments
+    ) internal {
+        TreeRootPair[] memory forcedAuthData = new TreeRootPair[](1);
+        forcedAuthData[0] = TreeRootPair({treeNumber: requestAuthContext, root: uint256(requestAuthId)});
+        vm.prank(submitter);
         pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
+            _roots(),
+            forcedAuthData,
+            requestAccountId,
             nullifiers,
             commitments,
-            withdrawal,
+            Withdrawal({to: alice, tokenId: tokenId, amount: AMOUNT}),
             EpochHelpers.dummyProof()
         );
+    }
 
-        // Check request stored (key = keccak256(requester, commitmentsHash))
-        uint256 requestKey = _getRequestKey(alice, commitments);
+    function _requestKey(uint256[] memory nullifiers, uint256[] memory commitments) internal pure returns (uint256) {
+        return uint256(
+            keccak256(
+                abi.encodePacked(
+                    REQUEST_KEY_DOMAIN,
+                    keccak256(abi.encodePacked(nullifiers)),
+                    keccak256(abi.encodePacked(commitments))
+                )
+            )
+        );
+    }
+
+    function _legacyRequestKey(address requester, uint256[] memory commitments) internal pure returns (uint256) {
+        return uint256(keccak256(abi.encodePacked(requester, keccak256(abi.encodePacked(commitments)))));
+    }
+
+    function _storeLegacyRequest(
+        address requester,
+        uint256[] memory nullifiers,
+        uint256[] memory commitments,
+        uint16 feeBps
+    ) internal returns (uint256 requestKey) {
+        requestKey = _legacyRequestKey(requester, commitments);
+        bytes32 requestBase = keccak256(abi.encode(requestKey, uint256(16)));
+
+        vm.store(address(pool), requestBase, bytes32(uint256(block.number) | (uint256(uint160(requester)) << 64)));
+        vm.store(
+            address(pool),
+            bytes32(uint256(requestBase) + 1),
+            bytes32(uint256(uint160(alice)) | (uint256(tokenId) << 160))
+        );
+        vm.store(
+            address(pool),
+            bytes32(uint256(requestBase) + 2),
+            bytes32(uint256(AMOUNT) | (uint256(feeBps) << 96) | (uint256(1) << 112))
+        );
+        vm.store(address(pool), bytes32(uint256(requestBase) + 3), bytes32(accountId));
+        vm.store(address(pool), bytes32(uint256(requestBase) + 4), keccak256(abi.encodePacked(nullifiers)));
+        vm.store(address(pool), bytes32(uint256(requestBase) + 5), keccak256(abi.encodePacked(commitments)));
+        bytes32 commitmentSlot = keccak256(abi.encode(commitments[0], uint256(17)));
+        vm.store(address(pool), commitmentSlot, bytes32(requestKey));
+    }
+
+    function test_authContextMatchesCrossLanguageGoldenVector() public pure {
+        assertEq(_authContext(0x0102030405060708, 1, 0xabcde, 0x1234), uint128(0x12469579bd0102030405060708));
+    }
+
+    function test_requestUsesLayoutFrozenRecordWithoutGivingRelayerAuthority() public {
+        pool.setTreasury(treasury);
+        pool.setFees(FEE_BPS);
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _arrays(11, 101);
+
+        _request(bob, nullifiers, commitments);
+
+        uint256 key = _requestKey(nullifiers, commitments);
         (
             uint64 requestBlock,
             address requester,
             address withdrawalTo,
-            uint16 tid,
-            uint96 amt,
+            uint16 storedTokenId,
+            uint96 amount,
             uint16 storedFeeBps,
             uint8 inputCount,
-            uint256 spenderAccountId,
+            uint256 storedAccountId,
             bytes32 nullifiersHash,
             bytes32 commitmentsHash
-        ) = pool.forcedWithdrawalRequests(requestKey);
-
+        ) = pool.forcedWithdrawalRequests(key);
         assertEq(requestBlock, block.number);
-        assertEq(requester, alice);
+        assertEq(requester, address(0));
         assertEq(withdrawalTo, alice);
-        assertEq(tid, tokenId);
-        assertEq(amt, AMOUNT);
-        assertEq(storedFeeBps, pool.withdrawFeeBps()); // Fee rate stored at request time
+        assertEq(storedTokenId, tokenId);
+        assertEq(amount, AMOUNT);
+        assertEq(storedFeeBps, FEE_BPS);
         assertEq(inputCount, 1);
-        assertEq(spenderAccountId, 12345);
+        assertEq(storedAccountId, accountId);
         assertEq(nullifiersHash, keccak256(abi.encodePacked(nullifiers)));
         assertEq(commitmentsHash, keccak256(abi.encodePacked(commitments)));
+        assertEq(pool.commitmentToRequestKey(commitments[0]), key);
 
-        // Check commitment to requestKey mapping
-        assertEq(pool.commitmentToRequestKey(commitments[0]), requestKey);
-    }
-
-    function test_requestForcedWithdrawal_emitsEvent() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-        vm.prank(alice);
-        vm.expectEmit(true, true, false, true);
-        emit IPrivacyBoost.ForcedWithdrawalRequested(alice, alice, tokenId, AMOUNT, nullifiers, commitments);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-    }
-
-    function test_revertWhen_nullifierAlreadySpent() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        // First request to simulate a spent nullifier scenario
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-
-        // Wait and execute to spend the nullifier
-        vm.roll(block.number + pool.forcedWithdrawalDelay() + 1);
-
-        vm.prank(alice);
-        pool.executeForcedWithdrawal(nullifiers, commitments);
-
-        // Now try to request again with the same (now spent) nullifier - need new commitment
-        (uint256[] memory nullifiers2, uint256[] memory commitments2) = _toArrays(123, 789);
-        authRoots = _getAuthRoots();
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.InvalidNullifierSet.selector);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers2,
-            commitments2,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-    }
-
-    function test_revertWhen_alreadyRequested() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-
-        // Try to request again (same commitment already has pending request)
-        authRoots = _getAuthRoots();
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.ForcedWithdrawalAlreadyRequested.selector);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-    }
-
-    function test_revertWhen_zeroAddress() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-        Withdrawal memory withdrawal = _makeWithdrawal(address(0), tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.InvalidWithdrawal.selector);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-    }
-
-    function test_revertWhen_unregisteredTokenId() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, uint16(999), AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.InvalidWithdrawal.selector);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-
-        // Ensure the commitment wasn't locked.
-        assertEq(pool.commitmentToRequestKey(commitments[0]), 0);
-    }
-
-    function test_revertWhen_duplicateTreeNumberInKnownRoots() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(321, 654);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        // Duplicate tree number in knownRoots should be rejected.
-        TreeRootPair[] memory knownRoots = new TreeRootPair[](2);
-        knownRoots[0] = TreeRootPair({treeNumber: 0, root: rootVal});
-        knownRoots[1] = TreeRootPair({treeNumber: 0, root: rootVal});
-
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.DuplicateTreeNumber.selector);
-        pool.requestForcedWithdrawal(
-            knownRoots,
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-    }
-
-    // ========== Step 2: Execute ==========
-
-    function test_executeForcedWithdrawal() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        // Step 1: Request (with proof verification)
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-
-        // Wait for delay
-        vm.roll(block.number + pool.forcedWithdrawalDelay() + 1);
-
-        uint256 aliceBalBefore = token.balanceOf(alice);
-
-        // Step 2: Execute (no proof needed, nullifiers + commitments for hash verification)
-        vm.prank(alice);
-        pool.executeForcedWithdrawal(nullifiers, commitments);
-
-        // Check token transferred
-        assertEq(token.balanceOf(alice), aliceBalBefore + AMOUNT);
-
-        // Check request cleared
-        uint256 requestKey = _getRequestKey(alice, commitments);
-        (uint64 requestBlock,,,,,,,,,) = pool.forcedWithdrawalRequests(requestKey);
-        assertEq(requestBlock, 0);
-
-        // Check commitment mapping cleared
-        assertEq(pool.commitmentToRequestKey(commitments[0]), 0);
-
-        // Check nullifier spent
-        assertTrue(pool.nullifierSpent(nullifiers[0]));
-    }
-
-    function test_revertWhen_executeTooEarly() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-
-        // Don't wait for delay
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.ForcedWithdrawalTooEarly.selector);
-        pool.executeForcedWithdrawal(nullifiers, commitments);
-    }
-
-    function test_revertWhen_notRequested() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.ForcedWithdrawalNotRequested.selector);
-        pool.executeForcedWithdrawal(nullifiers, commitments);
-    }
-
-    function test_executeForcedWithdrawal_permissionlessCaller() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-
-        vm.roll(block.number + pool.forcedWithdrawalDelay() + 1);
-
-        address bob = makeAddr("bob");
-        uint256 aliceBalBefore = token.balanceOf(alice);
         vm.prank(bob);
-        pool.executeForcedWithdrawal(nullifiers, commitments);
-
-        // Check token transferred to withdrawal recipient (Alice)
-        assertEq(token.balanceOf(alice), aliceBalBefore + AMOUNT);
-
-        // Check request cleared
-        uint256 requestKey = _getRequestKey(alice, commitments);
-        (uint64 requestBlock,,,,,,,,,) = pool.forcedWithdrawalRequests(requestKey);
-        assertEq(requestBlock, 0);
-
-        // Check commitment mapping cleared
-        assertEq(pool.commitmentToRequestKey(commitments[0]), 0);
-
-        // Check nullifier spent
-        assertTrue(pool.nullifierSpent(nullifiers[0]));
-    }
-
-    // ========== Cancel ==========
-
-    function test_cancelForcedWithdrawal() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-
-        vm.roll(block.number + pool.forcedWithdrawalDelay() + 1);
-
-        vm.prank(alice);
-        pool.cancelForcedWithdrawal(nullifiers, commitments);
-
-        // Check request cleared
-        uint256 requestKey = _getRequestKey(alice, commitments);
-        (uint64 requestBlock,,,,,,,,,) = pool.forcedWithdrawalRequests(requestKey);
-        assertEq(requestBlock, 0);
-
-        // Check commitment mapping cleared
-        assertEq(pool.commitmentToRequestKey(commitments[0]), 0);
-    }
-
-    function test_revertWhen_cancelNotRequester() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-
-        vm.roll(block.number + pool.forcedWithdrawalDelay() + 1);
-
-        // Bob tries to cancel Alice's request - Bob is neither the requester nor the account owner
-        address bob = makeAddr("bob");
-        vm.prank(bob);
-        vm.expectRevert(IPrivacyBoost.NotRequesterOrOwner.selector);
+        vm.expectRevert(IPrivacyBoost.NotAccountOwner.selector);
         pool.cancelForcedWithdrawal(nullifiers, commitments);
     }
 
-    function test_revertWhen_cancelTooEarly() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
+    function test_requestRejectsRevokedAuthorization() public {
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _arrays(12, 102);
         vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
+        authRegistry.revokeSpendApprovalBatch(accountId, approvalBatchRoot);
 
-        // Don't wait
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.ForcedWithdrawalTooEarly.selector);
-        pool.cancelForcedWithdrawal(nullifiers, commitments);
+        vm.expectRevert(IPrivacyBoost.ForcedAuthorizationInvalid.selector);
+        _request(bob, nullifiers, commitments);
     }
 
-    // ========== Transfer Priority (Core DoS Prevention) ==========
+    function test_requestRejectsAuthorizationAtDifferentLeafIndex() public {
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _arrays(13, 103);
+        uint128 wrongIndexContext = _authContext() | (uint128(1) << 65);
 
-    function test_transferWins_whenExecutedBeforeForcedWithdrawal() public {
-        // Use two different nullifiers: one for forced withdrawal, one to simulate transfer winning
-        (uint256[] memory nullifiers1, uint256[] memory commitments1) = _toArrays(111, 222);
-        (uint256[] memory nullifiers2, uint256[] memory commitments2) = _toArrays(333, 444);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        Withdrawal memory withdrawal1 = _makeWithdrawal(alice, tokenId, AMOUNT);
-        Withdrawal memory withdrawal2 = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        // Alice requests forced withdrawal for commitment 222
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers1,
-            commitments1,
-            withdrawal1,
-            EpochHelpers.dummyProof()
-        );
-
-        // Alice also requests forced withdrawal for commitment 444
-        authRoots = _getAuthRoots();
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers2,
-            commitments2,
-            withdrawal2,
-            EpochHelpers.dummyProof()
-        );
-
-        vm.roll(block.number + pool.forcedWithdrawalDelay() + 1);
-
-        // Execute second request first (simulating normal transfer that wins)
-        vm.prank(alice);
-        pool.executeForcedWithdrawal(nullifiers2, commitments2);
-
-        // Nullifier 333 is now spent
-        assertTrue(pool.nullifierSpent(nullifiers2[0]));
-
-        // Alice can still execute her forced withdrawal for commitment 222
-        vm.prank(alice);
-        pool.executeForcedWithdrawal(nullifiers1, commitments1);
-
-        // Both nullifiers are now spent
-        assertTrue(pool.nullifierSpent(nullifiers1[0]));
-        assertTrue(pool.nullifierSpent(nullifiers2[0]));
+        vm.expectRevert(IPrivacyBoost.ForcedAuthorizationInvalid.selector);
+        _requestWithAuthorization(bob, accountId, wrongIndexContext, authId, nullifiers, commitments);
     }
 
-    // ========== Prover DoS Prevention Test ==========
+    function test_requestRejectsAuthorizationAtDifferentTreeNumber() public {
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _arrays(13, 103);
+        uint128 wrongTreeContext = _authContext() | (uint128(1) << 85);
 
-    function test_proverDoS_preventsAttackerWithFakeNullifier() public {
-        // This test demonstrates that with proof verification at request time,
-        // an attacker cannot create fake requests for existing commitments.
-        // The MockVerifier always returns true, but in production, the attacker
-        // would need a valid proof which requires knowing the note's secret.
-
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        // Alice (the legitimate owner) can request because she can generate valid proof
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-
-        // Verify request is stored
-        uint256 requestKey = _getRequestKey(alice, commitments);
-        (uint64 requestBlock,,,,,,,,,) = pool.forcedWithdrawalRequests(requestKey);
-        assertTrue(requestBlock != 0);
-
-        // Verify commitment mapping is set
-        assertEq(pool.commitmentToRequestKey(commitments[0]), requestKey);
-
-        // In production:
-        // - Attacker would try to create fake request with random nullifier
-        // - But the circuit verifies nullifier = Poseidon(noteSecret, leafIndex)
-        // - Without noteSecret, attacker cannot generate valid proof
-        // - So only the legitimate owner can request forced withdrawal
+        vm.expectRevert(IPrivacyBoost.ForcedAuthorizationInvalid.selector);
+        _requestWithAuthorization(bob, accountId, wrongTreeContext, authId, nullifiers, commitments);
     }
 
-    // ========== New Design: Request Key Per Batch ==========
+    function test_requestRejectsExpiredAuthorization() public {
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _arrays(14, 104);
+        vm.warp(uint256(authExpiry) + 1);
 
-    function test_multiInput_singleRequestKey() public {
-        // Test that multiple input notes create a single request with hash-based verification
+        vm.expectRevert(IPrivacyBoost.ForcedAuthorizationExpired.selector);
+        _request(bob, nullifiers, commitments);
+    }
+
+    function test_requestRejectsNonCanonicalContext() public {
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _arrays(15, 105);
+        uint128 badContext = _authContext() | (uint128(1) << 108);
+
+        vm.expectRevert(IPrivacyBoost.InvalidForcedAuthContext.selector);
+        _requestWithAuthorization(bob, accountId, badContext, authId, nullifiers, commitments);
+    }
+
+    function test_requestRejectsDuplicateAndZeroInputs() public {
         uint256[] memory nullifiers = new uint256[](2);
-        nullifiers[0] = 100;
-        nullifiers[1] = 200;
         uint256[] memory commitments = new uint256[](2);
-        commitments[0] = 111;
-        commitments[1] = 222;
+        nullifiers[0] = 16;
+        nullifiers[1] = 16;
+        commitments[0] = 106;
+        commitments[1] = 107;
 
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-
-        // Check single request exists
-        uint256 requestKey = _getRequestKey(alice, commitments);
-        (uint64 requestBlock,, address withdrawalTo,,,, uint8 inputCount,,,) = pool.forcedWithdrawalRequests(requestKey);
-        assertTrue(requestBlock != 0);
-        assertEq(withdrawalTo, alice);
-        assertEq(inputCount, 2);
-
-        // Check both commitments map to same requestKey
-        assertEq(pool.commitmentToRequestKey(commitments[0]), requestKey);
-        assertEq(pool.commitmentToRequestKey(commitments[1]), requestKey);
-
-        // Wait and execute
-        vm.roll(block.number + pool.forcedWithdrawalDelay() + 1);
-
-        vm.prank(alice);
-        pool.executeForcedWithdrawal(nullifiers, commitments);
-
-        // Check all cleared
-        (requestBlock,,,,,,,,,) = pool.forcedWithdrawalRequests(requestKey);
-        assertEq(requestBlock, 0);
-        assertEq(pool.commitmentToRequestKey(commitments[0]), 0);
-        assertEq(pool.commitmentToRequestKey(commitments[1]), 0);
-        assertTrue(pool.nullifierSpent(nullifiers[0]));
-        assertTrue(pool.nullifierSpent(nullifiers[1]));
-    }
-
-    function test_revertWhen_hashMismatch() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-
-        vm.roll(block.number + pool.forcedWithdrawalDelay() + 1);
-
-        // Try to execute with wrong nullifiers (hash won't match)
-        uint256[] memory wrongNullifiers = new uint256[](1);
-        wrongNullifiers[0] = 999;
-
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.ForcedWithdrawalMismatch.selector);
-        pool.executeForcedWithdrawal(wrongNullifiers, commitments);
-    }
-
-    function test_revertWhen_inputCountMismatch() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(123, 456);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-
-        vm.roll(block.number + pool.forcedWithdrawalDelay() + 1);
-
-        // Try to execute with different number of inputs
-        uint256[] memory twoNullifiers = new uint256[](2);
-        twoNullifiers[0] = 123;
-        twoNullifiers[1] = 456;
-        uint256[] memory twoCommitments = new uint256[](2);
-        twoCommitments[0] = 456;
-        twoCommitments[1] = 789;
-
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.ForcedWithdrawalMismatch.selector);
-        pool.executeForcedWithdrawal(twoNullifiers, twoCommitments);
-    }
-
-    // ========== Auth Snapshot Validation Tests ==========
-
-    /// @notice Test that request with current round snapshot succeeds
-    function test_requestWithCurrentRoundSnapshot() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(777, 888);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        uint256 currentRound = block.number / AUTH_SNAPSHOT_INTERVAL;
-
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, currentRound),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-
-        // Verify request was stored
-        uint256 requestKey = _getRequestKey(alice, commitments);
-        (uint64 requestBlock,,,,,,,,,) = pool.forcedWithdrawalRequests(requestKey);
-        assertGt(requestBlock, 0, "Request should be stored with current round snapshot");
-    }
-
-    /// @notice Forced withdrawals must not be able to create new snapshots (prevents first-caller race)
-    function test_revertWhen_currentRoundNotSnapshotted() public {
-        // Move to a new round without taking a snapshot for it
-        vm.roll(AUTH_SNAPSHOT_INTERVAL * 5); // Round 5
-
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(1234, 5678);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-
-        uint256 currentRound = block.number / AUTH_SNAPSHOT_INTERVAL;
-        assertEq(currentRound, 5);
-
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        // No relay snapshot has been taken for round 5, so this must revert.
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.AuthTreeNotSnapshotted.selector);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, currentRound),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-
-        // Once the relay snapshots, the same round becomes usable.
-        _snapshotTree0ForCurrentRound();
-
-        authRoots = _getAuthRoots();
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, currentRound),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-    }
-
-    /// @notice Test that request with previous round snapshot succeeds (grace period)
-    function test_requestWithPreviousRoundSnapshot() public {
-        // Warp to a known block so we have predictable rounds
-        vm.roll(AUTH_SNAPSHOT_INTERVAL * 10); // Start at round 10
-
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(111, 222);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        uint256 snapshotRound = block.number / AUTH_SNAPSHOT_INTERVAL; // Should be 10
-
-        // Create snapshot for current round (round 10) via relay-controlled snapshot function
-        _snapshotTree0ForCurrentRound();
-        assertEq(pool.latestSnapshotRound(), snapshotRound, "latestSnapshotRound should update on snapshot");
-        assertEq(pool.authSnapshots(snapshotRound, 0), authRegistry.authTreeRoot(0), "snapshot root mismatch");
-
-        // Roll forward to next round (round 11)
-        vm.roll(AUTH_SNAPSHOT_INTERVAL * 11);
-
-        // Request with previous round snapshot (round 10, grace period allows N-1)
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, snapshotRound),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-
-        // Verify request was stored
-        uint256 requestKey = _getRequestKey(alice, commitments);
-        (uint64 requestBlock,,,,,,,,,) = pool.forcedWithdrawalRequests(requestKey);
-        assertGt(requestBlock, 0, "Request should be stored with previous round snapshot");
-    }
-
-    /// @notice Test that request with too old snapshot (N-2) reverts
-    function test_revertWhen_authSnapshotTooOld() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(333, 444);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-
-        // Get current round, then try to use a round that's N-2
-        uint256 currentRound = block.number / AUTH_SNAPSHOT_INTERVAL;
-        uint256 tooOldRound = 0; // Round 0 when we're at any round >= 2
-
-        // Make sure we're at least at round 2 so round 0 is "too old"
-        if (currentRound < 2) {
-            vm.roll(AUTH_SNAPSHOT_INTERVAL * 2 + 1);
-        }
-
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-        // Request with round 0 (which is N-2 or older) should fail
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.InvalidAuthSnapshotRound.selector);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, tooOldRound),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-    }
-
-    /// @notice Test that request with future round reverts
-    function test_revertWhen_authSnapshotFutureRound() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(555, 666);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        uint256 currentRound = block.number / AUTH_SNAPSHOT_INTERVAL;
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        // Try to use a future round
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.InvalidAuthSnapshotRound.selector);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, currentRound + 1),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-    }
-
-    // ========== Latest Snapshot Round Tests ==========
-
-    /// @notice Test that latestSnapshotRound is updated when a snapshot is taken
-    function test_latestSnapshotRoundUpdated() public {
-        vm.roll(AUTH_SNAPSHOT_INTERVAL * 5); // Start at round 5
-
-        // Initially latestSnapshotRound should be 0 (no non-zero snapshots taken)
-        assertEq(pool.latestSnapshotRound(), 0, "Initial latestSnapshotRound should be 0");
-
-        _snapshotTree0ForCurrentRound();
-
-        // latestSnapshotRound should now be 5
-        assertEq(pool.latestSnapshotRound(), 5, "latestSnapshotRound should be updated to 5");
-    }
-
-    /// @notice Test downtime scenario: old proof remains valid until new snapshot is taken
-    function test_downtimeScenario_oldProofStillValid() public {
-        vm.roll(AUTH_SNAPSHOT_INTERVAL * 10); // Start at round 10
-
-        // Create snapshot at round 10
-        _snapshotTree0ForCurrentRound();
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-
-        assertEq(pool.latestSnapshotRound(), 10, "latestSnapshotRound should be 10");
-
-        // Simulate long downtime: jump to round 100 (no activity in between)
-        vm.roll(AUTH_SNAPSHOT_INTERVAL * 100);
-
-        // latestSnapshotRound is still 10 (no new snapshots taken)
-        assertEq(pool.latestSnapshotRound(), 10, "latestSnapshotRound should still be 10 after downtime");
-
-        // User with round 10 proof can still submit (latestSnapshotRound == 10)
-        (uint256[] memory nullifiers2, uint256[] memory commitments2) = _toArrays(2003, 2004);
-        Withdrawal memory withdrawal2 = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, 10),
-            12345,
-            nullifiers2,
-            commitments2,
-            withdrawal2,
-            EpochHelpers.dummyProof()
-        );
-
-        // Request should be stored
-        uint256 requestKey = _getRequestKey(alice, commitments2);
-        (uint64 requestBlock,,,,,,,,,) = pool.forcedWithdrawalRequests(requestKey);
-        assertGt(requestBlock, 0, "Request with old round 10 proof should succeed after downtime");
-    }
-
-    /// @notice Test that old proof becomes invalid after new snapshot is taken
-    function test_oldProofInvalidAfterNewSubmission() public {
-        vm.roll(AUTH_SNAPSHOT_INTERVAL * 10); // Start at round 10
-
-        // Create snapshot at round 10
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        _snapshotTree0ForCurrentRound();
-
-        assertEq(pool.latestSnapshotRound(), 10);
-
-        // Jump to round 100
-        vm.roll(AUTH_SNAPSHOT_INTERVAL * 100);
-
-        // Create new snapshot at round 100
-        _snapshotTree0ForCurrentRound();
-
-        assertEq(pool.latestSnapshotRound(), 100, "latestSnapshotRound should now be 100");
-
-        // Now user B with old round 10 proof should fail
-        // (10 != latestSnapshotRound(100) AND 10+1 != latestSnapshotRound(100))
-        (uint256[] memory nullifiers3, uint256[] memory commitments3) = _toArrays(3005, 3006);
-        Withdrawal memory withdrawal3 = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.InvalidAuthSnapshotRound.selector);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, 10),
-            12345,
-            nullifiers3,
-            commitments3,
-            withdrawal3,
-            EpochHelpers.dummyProof()
-        );
-    }
-
-    /// @notice Test grace period: latestSnapshotRound - 1 is also valid
-    function test_gracePeriodWithLatestSnapshot() public {
-        vm.roll(AUTH_SNAPSHOT_INTERVAL * 10); // Start at round 10
-
-        // Create snapshot at round 10
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        _snapshotTree0ForCurrentRound();
-
-        assertEq(pool.latestSnapshotRound(), 10);
-
-        // Roll to round 11 and create snapshot
-        vm.roll(AUTH_SNAPSHOT_INTERVAL * 11);
-
-        _snapshotTree0ForCurrentRound();
-
-        assertEq(pool.latestSnapshotRound(), 11);
-
-        // Now round 10 should still work (grace period: latestSnapshotRound - 1)
-        (uint256[] memory nullifiers3, uint256[] memory commitments3) = _toArrays(4005, 4006);
-        Withdrawal memory withdrawal3 = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, 10),
-            12345,
-            nullifiers3,
-            commitments3,
-            withdrawal3,
-            EpochHelpers.dummyProof()
-        );
-
-        // Should succeed
-        uint256 requestKey = _getRequestKey(alice, commitments3);
-        (uint64 requestBlock,,,,,,,,,) = pool.forcedWithdrawalRequests(requestKey);
-        assertGt(requestBlock, 0, "Request with previous round (grace period) should succeed");
-
-        // But round 9 should fail (not in grace period)
-        (uint256[] memory nullifiers4, uint256[] memory commitments4) = _toArrays(4007, 4008);
-        Withdrawal memory withdrawal4 = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        authRoots = _getAuthRoots();
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.InvalidAuthSnapshotRound.selector);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, 9),
-            12345,
-            nullifiers4,
-            commitments4,
-            withdrawal4,
-            EpochHelpers.dummyProof()
-        );
-    }
-
-    // ========== Duplicate Check in Request (Lines 483-488) ==========
-
-    /// @notice Test that duplicate nullifier within same request array reverts
-    function test_revertWhen_duplicateNullifierInSameRequestArray() public {
-        // Same nullifier appears twice in the array
-        uint256[] memory nullifiers = new uint256[](2);
-        nullifiers[0] = 999;
-        nullifiers[1] = 999; // Duplicate!
-        uint256[] memory commitments = new uint256[](2);
-        commitments[0] = 1001;
-        commitments[1] = 1002;
-
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        vm.prank(alice);
         vm.expectRevert(IPrivacyBoost.DuplicateNullifier.selector);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
-    }
+        _request(bob, nullifiers, commitments);
 
-    /// @notice Test that duplicate input commitment within same request array reverts
-    function test_revertWhen_duplicateInputCommitmentInSameRequestArray() public {
-        // Same commitment appears twice in the array
-        uint256[] memory nullifiers = new uint256[](2);
-        nullifiers[0] = 888;
-        nullifiers[1] = 889;
-        uint256[] memory commitments = new uint256[](2);
-        commitments[0] = 2001;
-        commitments[1] = 2001; // Duplicate!
-
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, AMOUNT);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
-
-        vm.prank(alice);
+        nullifiers[1] = 17;
+        commitments[1] = commitments[0];
         vm.expectRevert(IPrivacyBoost.DuplicateInputCommitment.selector);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
+        _request(bob, nullifiers, commitments);
+
+        (nullifiers, commitments) = _arrays(18, 0);
+        vm.expectRevert(IPrivacyBoost.InvalidSlotPadding.selector);
+        _request(bob, nullifiers, commitments);
     }
 
-    // ========== Coverage Tests: Nullifier Spent via vm.store (Line 631) ==========
+    function test_executeUsesSnapshotAfterDelayDespiteFeeAndAuthChanges() public {
+        pool.setTreasury(treasury);
+        pool.setFees(FEE_BPS);
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _arrays(19, 109);
+        _request(bob, nullifiers, commitments);
 
-    /// @notice Test InvalidNullifierSet in executeForcedWithdrawal when nullifier spent via vm.store (Line 631)
-    function test_revertWhen_executeForcedWithdrawal_nullifierSpentViaStore() public {
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(100, 200);
-        Withdrawal memory withdrawal = _makeWithdrawal(alice, tokenId, 500 ether);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots();
+        vm.expectRevert(IPrivacyBoost.ForcedWithdrawalTooEarly.selector);
+        pool.executeForcedWithdrawal(nullifiers, commitments);
 
         vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
-        );
+        authRegistry.revokeSpendApprovalBatch(accountId, approvalBatchRoot);
+        pool.setFees(500);
+        vm.warp(uint256(authExpiry) + 1);
+        vm.roll(block.number + pool.forcedWithdrawalDelay());
+        pool.executeForcedWithdrawal(nullifiers, commitments);
 
-        // Wait for delay
-        vm.roll(block.number + pool.forcedWithdrawalDelay() + 1);
+        assertTrue(pool.nullifierSpent(nullifiers[0]));
+        assertEq(token.balanceOf(alice), 980 ether);
+        assertEq(token.balanceOf(treasury), 20 ether);
+        assertEq(pool.commitmentToRequestKey(commitments[0]), 0);
+    }
 
-        // Simulate the nullifier being spent through a normal transfer
-        // Using vm.store to set nullifierSpent[100] = true
-        // nullifierSpent is at storage slot 11 (after operator was added)
-        bytes32 nullifierSlot = keccak256(abi.encode(uint256(100), uint256(11)));
-        vm.store(address(pool), nullifierSlot, bytes32(uint256(1)));
+    function test_executePaysGrossWhenTreasuryUnset() public {
+        // Arrange
+        pool.setTreasury(treasury);
+        pool.setFees(FEE_BPS);
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _arrays(26, 116);
+        _request(bob, nullifiers, commitments);
+        uint256 requestKey = _requestKey(nullifiers, commitments);
+        uint256 poolBalanceBefore = token.balanceOf(address(pool));
 
-        // Verify nullifier is now marked as spent
-        assertTrue(pool.nullifierSpent(100));
+        pool.setFees(0);
+        pool.setTreasury(address(0));
+        vm.roll(block.number + pool.forcedWithdrawalDelay());
 
-        // Try to execute - should revert with InvalidNullifierSet (Line 631)
-        vm.prank(alice);
-        vm.expectRevert(IPrivacyBoost.InvalidNullifierSet.selector);
+        // Act
+        vm.expectEmit(true, false, false, true, address(pool));
+        emit IPrivacyBoost.ForcedWithdrawalExecuted(alice, tokenId, AMOUNT, nullifiers, commitments);
+        pool.executeForcedWithdrawal(nullifiers, commitments);
+
+        // Assert
+        assertTrue(pool.nullifierSpent(nullifiers[0]));
+        assertEq(token.balanceOf(alice), AMOUNT);
+        assertEq(token.balanceOf(treasury), 0);
+        assertEq(poolBalanceBefore - token.balanceOf(address(pool)), AMOUNT);
+        assertEq(pool.commitmentToRequestKey(commitments[0]), 0);
+        (uint64 requestBlock,,,,,,,,,) = pool.forcedWithdrawalRequests(requestKey);
+        assertEq(requestBlock, 0);
+    }
+
+    function test_executeRejectsMismatchedNullifiers() public {
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _arrays(20, 110);
+        _request(bob, nullifiers, commitments);
+        vm.roll(block.number + pool.forcedWithdrawalDelay());
+
+        nullifiers[0] += 1;
+        vm.expectRevert(IPrivacyBoost.ForcedWithdrawalMismatch.selector);
         pool.executeForcedWithdrawal(nullifiers, commitments);
     }
-}
 
-/// @notice Tests for forced withdrawal with fees (Line 658)
-contract ForcedWithdrawalWithFeeTest is Test {
-    PrivacyBoost pool;
-    TokenRegistry tokenRegistry;
-    AuthRegistry authRegistry;
-    MockVerifier verifier;
-    MockERC20 token;
+    function test_accountOwnerCanCancelImmediately() public {
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _arrays(21, 111);
+        _request(bob, nullifiers, commitments);
 
-    address owner = address(this);
-    address proxyAdmin = address(0xAD);
-    address alice = makeAddr("alice");
-    address relay = makeAddr("relay");
-    address treasury = makeAddr("treasury");
-    address operator = makeAddr("operator");
-
-    uint16 tokenId;
-    uint96 constant AMOUNT = 1000 ether;
-    uint256 constant AUTH_SNAPSHOT_INTERVAL = 300;
-
-    function setUp() public {
-        verifier = new MockVerifier();
-
-        DeployConfig memory cfg = PoolDeployer.defaultConfig(owner, proxyAdmin, address(verifier));
-        cfg.withdrawFeeBps = 200;
-        cfg.treasury = treasury;
-        (pool, tokenRegistry, authRegistry) = PoolDeployer.deployFullStack(cfg);
-
-        token = new MockERC20();
-        tokenId = tokenRegistry.register(TOKEN_TYPE_ERC20, address(token), 0);
-
-        token.mint(address(pool), 100_000 ether);
-
-        // Set operator
-        pool.setOperator(operator);
-
-        address[] memory relays = new address[](1);
-        relays[0] = relay;
-        vm.prank(operator);
-        pool.setAllowedRelays(relays, true);
-
-        // Establish an initial snapshot for the current round so permissionless forced withdrawals
-        // can validate against an existing snapshot (requestForcedWithdrawal must not create snapshots).
-        uint256[] memory treeNums = new uint256[](1);
-        treeNums[0] = 0;
-        vm.prank(relay);
-        pool.snapshotAuthTrees(treeNums);
+        vm.prank(alice);
+        pool.cancelForcedWithdrawal(nullifiers, commitments);
+        assertEq(pool.commitmentToRequestKey(commitments[0]), 0);
     }
 
-    function _toArrays(uint256 nullifier, uint256 commitment)
+    function test_revokeThenCancelPreventsProofResubmission() public {
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _arrays(25, 115);
+        _request(bob, nullifiers, commitments);
+
+        vm.startPrank(alice);
+        authRegistry.revokeSpendApprovalBatch(accountId, approvalBatchRoot);
+        pool.cancelForcedWithdrawal(nullifiers, commitments);
+        vm.stopPrank();
+
+        vm.expectRevert(IPrivacyBoost.ForcedAuthorizationInvalid.selector);
+        _request(bob, nullifiers, commitments);
+    }
+
+    function test_unrelatedCallerCanOnlyPruneAfterCompetingSpend() public {
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _arrays(22, 112);
+        _request(bob, nullifiers, commitments);
+
+        vm.prank(keeper);
+        vm.expectRevert(IPrivacyBoost.NotAccountOwner.selector);
+        pool.cancelForcedWithdrawal(nullifiers, commitments);
+
+        bytes32 nullifierSlot = keccak256(abi.encode(nullifiers[0], uint256(11)));
+        vm.store(address(pool), nullifierSlot, bytes32(uint256(1)));
+        vm.prank(keeper);
+        pool.cancelForcedWithdrawal(nullifiers, commitments);
+        assertEq(pool.commitmentToRequestKey(commitments[0]), 0);
+    }
+
+    function test_legacyPendingRequestRemainsExecutable() public {
+        pool.setTreasury(treasury);
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _arrays(23, 113);
+        uint256 requestKey = _storeLegacyRequest(bob, nullifiers, commitments, FEE_BPS);
+
+        vm.roll(block.number + pool.forcedWithdrawalDelay());
+        vm.prank(keeper);
+        pool.executeForcedWithdrawal(nullifiers, commitments);
+
+        assertTrue(pool.nullifierSpent(nullifiers[0]));
+        assertEq(token.balanceOf(alice), 980 ether);
+        assertEq(token.balanceOf(treasury), 20 ether);
+        assertEq(pool.commitmentToRequestKey(commitments[0]), 0);
+        (uint64 requestBlock,,,,,,,,,) = pool.forcedWithdrawalRequests(requestKey);
+        assertEq(requestBlock, 0);
+    }
+
+    function test_legacyPendingRequestPaysGrossWhenTreasuryUnset() public {
+        // Arrange
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _arrays(27, 117);
+        uint256 requestKey = _storeLegacyRequest(bob, nullifiers, commitments, FEE_BPS);
+        uint256 poolBalanceBefore = token.balanceOf(address(pool));
+        vm.roll(block.number + pool.forcedWithdrawalDelay());
+
+        // Act
+        vm.expectEmit(true, false, false, true, address(pool));
+        emit IPrivacyBoost.ForcedWithdrawalExecuted(alice, tokenId, AMOUNT, nullifiers, commitments);
+        pool.executeForcedWithdrawal(nullifiers, commitments);
+
+        // Assert
+        assertTrue(pool.nullifierSpent(nullifiers[0]));
+        assertEq(token.balanceOf(alice), AMOUNT);
+        assertEq(poolBalanceBefore - token.balanceOf(address(pool)), AMOUNT);
+        assertEq(pool.commitmentToRequestKey(commitments[0]), 0);
+        (uint64 requestBlock,,,,,,,,,) = pool.forcedWithdrawalRequests(requestKey);
+        assertEq(requestBlock, 0);
+    }
+
+    function test_legacyRequesterCannotCancelButOwnerCan() public {
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _arrays(24, 114);
+        _storeLegacyRequest(bob, nullifiers, commitments, 0);
+
+        vm.prank(bob);
+        vm.expectRevert(IPrivacyBoost.NotAccountOwner.selector);
+        pool.cancelForcedWithdrawal(nullifiers, commitments);
+
+        vm.prank(alice);
+        pool.cancelForcedWithdrawal(nullifiers, commitments);
+        assertEq(pool.commitmentToRequestKey(commitments[0]), 0);
+    }
+
+    /// @dev Builds `pool.maxForcedInputs() + 1` distinct, non-zero nullifiers and commitments from a seed,
+    ///      so the resulting request's input count always exceeds the current bound.
+    function _oversizedArrays(uint256 seed)
         internal
-        pure
+        view
         returns (uint256[] memory nullifiers, uint256[] memory commitments)
     {
-        nullifiers = new uint256[](1);
-        nullifiers[0] = nullifier;
-        commitments = new uint256[](1);
-        commitments[0] = commitment;
+        uint256 count = uint256(pool.maxForcedInputs()) + 1;
+        nullifiers = new uint256[](count);
+        commitments = new uint256[](count);
+        for (uint256 i = 0; i < count; ++i) {
+            nullifiers[i] = seed + i;
+            commitments[i] = seed + 1000 + i;
+        }
     }
 
-    function _getAuthRoots2() internal view returns (TreeRootPair[] memory) {
-        TreeRootPair[] memory roots = new TreeRootPair[](1);
-        roots[0] = TreeRootPair({treeNumber: 0, root: authRegistry.authTreeRoot(0)});
-        return roots;
-    }
+    /// @dev Stores a snapshot-format forced-withdrawal request with `commitments.length` inputs directly in
+    ///      the pool, mirroring the record {LibForced} writes. Stages the state a maxForcedInputs downgrade
+    ///      (an upgrade to an implementation with a smaller bound) leaves behind for a request that was
+    ///      accepted while the bound was higher.
+    function _storeOversizedRequest(uint256[] memory nullifiers, uint256[] memory commitments, uint16 feeBps)
+        internal
+        returns (uint256 requestKey)
+    {
+        requestKey = _requestKey(nullifiers, commitments);
+        bytes32 requestBase = keccak256(abi.encode(requestKey, uint256(16)));
 
-    function _makeWithdrawal2(address to, uint16 tid, uint96 amt) internal pure returns (Withdrawal memory) {
-        return Withdrawal({to: to, tokenId: tid, amount: amt});
-    }
-
-    /// @notice Test withdrawal with fee to treasury in executeForcedWithdrawal (Line 658)
-    function test_executeForcedWithdrawal_withFeeToTreasury() public {
-        assertEq(pool.withdrawFeeBps(), 200);
-        assertEq(pool.treasury(), treasury);
-
-        (uint256[] memory nullifiers, uint256[] memory commitments) = _toArrays(777, 888);
-        uint96 grossAmount = AMOUNT;
-        Withdrawal memory withdrawal = _makeWithdrawal2(alice, tokenId, grossAmount);
-
-        uint256 rootVal = pool.treeRoot(pool.currentTreeNumber());
-        TreeRootPair[] memory authRoots = _getAuthRoots2();
-
-        vm.prank(alice);
-        pool.requestForcedWithdrawal(
-            EpochHelpers.buildUsedRoots(0, rootVal),
-            EpochHelpers.buildAuthState(authRoots, block.number / AUTH_SNAPSHOT_INTERVAL),
-            12345,
-            nullifiers,
-            commitments,
-            withdrawal,
-            EpochHelpers.dummyProof()
+        // requester is address(0) for snapshot-format records: the relayer is never a cancellation principal.
+        vm.store(address(pool), requestBase, bytes32(uint256(block.number)));
+        vm.store(
+            address(pool),
+            bytes32(uint256(requestBase) + 1),
+            bytes32(uint256(uint160(alice)) | (uint256(tokenId) << 160))
         );
+        vm.store(
+            address(pool),
+            bytes32(uint256(requestBase) + 2),
+            bytes32(uint256(AMOUNT) | (uint256(feeBps) << 96) | (uint256(commitments.length) << 112))
+        );
+        vm.store(address(pool), bytes32(uint256(requestBase) + 3), bytes32(accountId));
+        vm.store(address(pool), bytes32(uint256(requestBase) + 4), keccak256(abi.encodePacked(nullifiers)));
+        vm.store(address(pool), bytes32(uint256(requestBase) + 5), keccak256(abi.encodePacked(commitments)));
+        for (uint256 i = 0; i < commitments.length; ++i) {
+            vm.store(address(pool), keccak256(abi.encode(commitments[i], uint256(17))), bytes32(requestKey));
+        }
+    }
 
-        vm.roll(block.number + pool.forcedWithdrawalDelay() + 1);
-
-        uint256 aliceBalBefore = token.balanceOf(alice);
-        uint256 treasuryBalBefore = token.balanceOf(treasury);
+    /// @dev Regression: a request whose input count exceeds the CURRENT maxForcedInputs, left behind when a
+    ///      later implementation lowers the bound, must stay cancellable by the account owner. Before the
+    ///      cancel/prune carve-out this reverted InvalidEpochConfig and locked the commitments permanently.
+    function test_ownerCancelsOversizedRequestAfterMaxInputsDowngrade() public {
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _oversizedArrays(30);
+        assertGt(nullifiers.length, pool.maxForcedInputs());
+        uint256 requestKey = _storeOversizedRequest(nullifiers, commitments, FEE_BPS);
 
         vm.prank(alice);
+        pool.cancelForcedWithdrawal(nullifiers, commitments);
+
+        for (uint256 i = 0; i < commitments.length; ++i) {
+            assertEq(pool.commitmentToRequestKey(commitments[i]), 0);
+        }
+        (uint64 requestBlock,,,,,,,,,) = pool.forcedWithdrawalRequests(requestKey);
+        assertEq(requestBlock, 0);
+    }
+
+    /// @dev Regression: pruning an oversized request after a competing spend must also stay reachable, and
+    ///      the carve-out must not weaken the authorization gate: a non-owner still cannot cancel until a
+    ///      competing nullifier spend makes execution impossible.
+    function test_prunesOversizedRequestAfterMaxInputsDowngrade() public {
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _oversizedArrays(40);
+        _storeOversizedRequest(nullifiers, commitments, FEE_BPS);
+
+        vm.prank(keeper);
+        vm.expectRevert(IPrivacyBoost.NotAccountOwner.selector);
+        pool.cancelForcedWithdrawal(nullifiers, commitments);
+
+        vm.store(address(pool), keccak256(abi.encode(nullifiers[0], uint256(11))), bytes32(uint256(1)));
+        vm.prank(keeper);
+        pool.cancelForcedWithdrawal(nullifiers, commitments);
+        for (uint256 i = 0; i < commitments.length; ++i) {
+            assertEq(pool.commitmentToRequestKey(commitments[i]), 0);
+        }
+    }
+
+    /// @dev The carve-out is cancel/prune only: execute still enforces maxForcedInputs, so an oversized
+    ///      request cannot be executed after a downgrade. The owner cancels and re-requests within the bound.
+    function test_executeStillRejectsOversizedRequestAfterMaxInputsDowngrade() public {
+        (uint256[] memory nullifiers, uint256[] memory commitments) = _oversizedArrays(50);
+        _storeOversizedRequest(nullifiers, commitments, FEE_BPS);
+
+        vm.expectRevert(IPrivacyBoost.InvalidEpochConfig.selector);
         pool.executeForcedWithdrawal(nullifiers, commitments);
-
-        // Calculate expected amounts
-        uint96 feeAmount = uint96((uint256(grossAmount) * 200) / 10_000); // 2% of 1000 = 20 ether
-        uint96 netAmount = grossAmount - feeAmount;
-
-        // Verify alice received net amount
-        assertEq(token.balanceOf(alice), aliceBalBefore + netAmount);
-
-        // Verify treasury received fee (Line 658)
-        assertEq(token.balanceOf(treasury), treasuryBalBefore + feeAmount);
     }
 }

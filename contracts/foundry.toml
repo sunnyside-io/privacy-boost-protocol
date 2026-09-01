@@ -12,6 +12,12 @@ remappings = [
     "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
 ]
 
+# Fixture files the Solidity tests read.
+fs_permissions = [
+    { access = "read", path = "../testdata" },
+    { access = "read", path = "testdata" },
+]
+
 # Profile for core contracts — higher optimizer runs for cheaper runtime gas.
 # Usage: FOUNDRY_PROFILE=optimized forge build
 [profile.optimized]

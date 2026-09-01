@@ -16,20 +16,9 @@
  */
 pragma solidity 0.8.34;
 
-import {Poseidon2T4} from "src/hash/Poseidon2T4.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-/// @title LibMerkleTree
-/// @notice External library for Merkle tree operations
-/// @dev Extracted from PrivacyBoost to reduce contract size
-library LibMerkleTree {
-    /// @notice Compute the zero root for an empty Merkle tree
-    /// @param depth The depth of the Merkle tree
-    /// @return The root of an empty tree with the given depth
-    function computeZeroRoot(uint8 depth) external pure returns (uint256) {
-        uint256 current = 0;
-        for (uint256 i = 0; i < depth; ++i) {
-            current = Poseidon2T4.hash2(current, current);
-        }
-        return current;
-    }
+/// @notice Minimal wrapped-native-token interface required by PortalDelegate.
+interface IWETH is IERC20 {
+    function deposit() external payable;
 }

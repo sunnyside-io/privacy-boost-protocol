@@ -24,7 +24,9 @@ import {ProxyAdmin} from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.s
 import {TokenRegistry} from "src/TokenRegistry.sol";
 import {AuthRegistry} from "src/AuthRegistry.sol";
 import {PrivacyBoost} from "src/PrivacyBoost.sol";
+import {IPrivacyBoost} from "src/interfaces/IPrivacyBoost.sol";
 import {TOKEN_TYPE_ERC20} from "src/interfaces/Constants.sol";
+import {TreeRootPair} from "src/interfaces/IStructs.sol";
 import {MockERC20, MockVerifier} from "test/helpers/Mocks.sol";
 import {PoolDeployer, DeployConfig} from "test/helpers/PoolDeployer.sol";
 
@@ -68,6 +70,8 @@ contract PrivacyBoostV2 is PrivacyBoost {
         uint256 cancelDelay_,
         uint256 forcedWithdrawalDelay_,
         uint32 maxForcedInputs_,
+        uint64 maxEpochAuthStalenessBlocks_,
+        uint64 maxForcedWithdrawalAuthStalenessBlocks_,
         uint8 merkleDepth_
     )
         PrivacyBoost(
@@ -80,6 +84,8 @@ contract PrivacyBoostV2 is PrivacyBoost {
             cancelDelay_,
             forcedWithdrawalDelay_,
             maxForcedInputs_,
+            maxEpochAuthStalenessBlocks_,
+            maxForcedWithdrawalAuthStalenessBlocks_,
             merkleDepth_
         )
     {}
@@ -95,6 +101,8 @@ contract PrivacyBoostV2 is PrivacyBoost {
 
 /// @notice Tests for upgradeable contracts with TransparentProxy
 contract UpgradeableTest is Test {
+    bytes32 private constant INITIALIZABLE_STORAGE = 0xf0c57e16840df040f15088dc2f81fe391c3923bec73e23a9662efc9c229c6a00;
+
     TokenRegistry tokenRegistry;
     AuthRegistry authRegistry;
     PrivacyBoost pool;
@@ -111,6 +119,44 @@ contract UpgradeableTest is Test {
     address proxyAdminOwner = makeAddr("proxyAdminOwner");
     address alice = makeAddr("alice");
     address operator = makeAddr("operator");
+    address relay = makeAddr("relay");
+
+    uint256 constant DEFAULT_SALT = 123;
+    uint256 constant PK1X = 15836372343211832006828833031571087401945044377577570170285606102491215895900;
+    uint256 constant PK1Y = 7801528930831391612913542953849263092120765287178679640990215688947513841260;
+    bytes32 private constant DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    bytes32 private constant NAME_HASH = keccak256("PB:AuthRegistry:vNext");
+    bytes32 private constant VERSION_HASH = keccak256("1");
+    bytes32 private constant REGISTER_TYPEHASH =
+        keccak256("Register(uint256 accountId,uint256 authPkX,uint256 authPkY,uint64 expiry,uint256 nonce)");
+
+    function _markAuthRegistryAsLegacyInitialized() internal {
+        vm.store(address(authRegistryProxy), INITIALIZABLE_STORAGE, bytes32(uint256(1)));
+        _openLegacyAnchorMigration();
+    }
+
+    function _openLegacyAnchorMigration() internal {
+        vm.store(address(authRegistryProxy), bytes32(uint256(10)), bytes32(0));
+    }
+
+    function _authRegistryDomainSeparator() internal view returns (bytes32) {
+        return keccak256(abi.encode(DOMAIN_TYPEHASH, NAME_HASH, VERSION_HASH, block.chainid, address(authRegistry)));
+    }
+
+    function _signRegister(
+        uint256 privateKey,
+        uint256 accountId,
+        uint256 authPkX,
+        uint256 authPkY,
+        uint64 expiry,
+        uint256 nonce
+    ) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encode(REGISTER_TYPEHASH, accountId, authPkX, authPkY, expiry, nonce));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _authRegistryDomainSeparator(), structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
+        return abi.encodePacked(r, s, v);
+    }
 
     function setUp() public {
         verifier = new MockVerifier();
@@ -197,10 +243,27 @@ contract UpgradeableTest is Test {
     }
 
     function test_authRegistry_statePreservedAfterUpgrade() public {
-        // Get initial state
+        // Arrange - populate storage slots whose ordering must remain stable across upgrades.
+        authRegistry.setOperator(operator);
+        address[] memory relays = new address[](1);
+        relays[0] = relay;
+        vm.prank(operator);
+        authRegistry.setAllowedRelays(relays, true);
+
+        uint256 privateKey = 0x1234;
+        address signer = vm.addr(privateKey);
+        uint256 accountId = authRegistry.computeAccountId(signer, DEFAULT_SALT);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        vm.prank(relay);
+        authRegistry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, signer, sig);
+
         uint256 initialRoot = authRegistry.authTreeRoot(0);
         uint256 initialTreeNumber = authRegistry.currentAuthTreeNumber();
+        uint256 authLeaf = authRegistry.computeLeaf(accountId, PK1X, PK1Y, expiry);
+        bytes32 authKeyId = authRegistry.computeAuthKeyId(accountId, PK1X);
 
+        // Act - upgrade via ProxyAdmin.
         // Deploy V2 implementation
         AuthRegistryV2 authRegistryV2Impl = new AuthRegistryV2(20);
         address proxyAdmin = _getProxyAdmin(address(authRegistryProxy));
@@ -210,11 +273,22 @@ contract UpgradeableTest is Test {
         ProxyAdmin(proxyAdmin)
             .upgradeAndCall(ITransparentUpgradeableProxy(address(authRegistryProxy)), address(authRegistryV2Impl), "");
 
-        // Verify state is preserved
+        // Assert - verify state is preserved
         AuthRegistryV2 authRegistryV2 = AuthRegistryV2(address(authRegistryProxy));
         assertEq(authRegistryV2.authTreeRoot(0), initialRoot);
         assertEq(authRegistryV2.currentAuthTreeNumber(), initialTreeNumber);
         assertEq(authRegistryV2.owner(), owner);
+        assertEq(authRegistryV2.ownerOf(accountId), signer);
+        assertEq(authRegistryV2.nonces(accountId), 1);
+        assertEq(authRegistryV2.operator(), operator);
+        assertTrue(authRegistryV2.allowedRelays(relay));
+        assertEq(authRegistryV2.authKeyTreeOf(authKeyId), 0);
+        assertEq(authRegistryV2.authKeyIndexOf(authKeyId), 0);
+        assertFalse(authRegistryV2.authKeyRevoked(authKeyId));
+        assertEq(authRegistryV2.authTreeCount(0), 1);
+        // No leaf-index migration or reinitializer is required: the existing
+        // level-zero Merkle slot remains the current-key source of truth.
+        assertTrue(authRegistryV2.isCurrentAuthLeafAt(0, authLeaf));
 
         // Verify new functionality works
         assertEq(authRegistryV2.version(), "v2");
@@ -222,10 +296,85 @@ contract UpgradeableTest is Test {
         assertEq(authRegistryV2.newVariable(), 123);
     }
 
+    function test_authRegistry_preUpgradeKeyCanPublicGiftExitWithoutLeafMigration() public {
+        uint256 privateKey = 0xA11CE;
+        address signer = vm.addr(privateKey);
+        uint256 accountId = authRegistry.computeAccountId(signer, DEFAULT_SALT);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        vm.prank(signer);
+        authRegistry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, signer, sig);
+
+        uint256 authLeaf = authRegistry.computeLeaf(accountId, PK1X, PK1Y, expiry);
+        uint256 preUpgradeAuthRoot = authRegistry.authTreeRoot(0);
+
+        // Upgrade without a reinitializer or any leaf backfill call.
+        AuthRegistryV2 authRegistryV2Impl = new AuthRegistryV2(20);
+        address proxyAdmin = _getProxyAdmin(address(authRegistryProxy));
+        vm.prank(ProxyAdmin(proxyAdmin).owner());
+        ProxyAdmin(proxyAdmin)
+            .upgradeAndCall(ITransparentUpgradeableProxy(address(authRegistryProxy)), address(authRegistryV2Impl), "");
+
+        uint16 tokenId = tokenRegistry.register(TOKEN_TYPE_ERC20, address(token), 0);
+        uint96 amount = 1 ether;
+        token.mint(address(pool), amount);
+
+        TreeRootPair[] memory noteRoots = new TreeRootPair[](1);
+        noteRoots[0] = TreeRootPair({treeNumber: 0, root: pool.treeRoot(0)});
+        TreeRootPair[] memory authRoots = new TreeRootPair[](1);
+        authRoots[0] = TreeRootPair({treeNumber: 0, root: preUpgradeAuthRoot});
+
+        // Packed location 0 is tree 0 / index 0. The exact leaf is proof-bound
+        // in production; MockVerifier isolates the post-upgrade settlement check.
+        pool.publicGiftExit(
+            noteRoots,
+            authRoots,
+            0xBEEF,
+            authLeaf,
+            0,
+            alice,
+            tokenId,
+            amount,
+            amount,
+            bytes32(0),
+            bytes32(0),
+            pool.treeCount(0),
+            block.number,
+            uint64(block.timestamp),
+            [uint256(0), 0, 0, 0, 0, 0, 0, 0]
+        );
+
+        assertEq(token.balanceOf(alice), amount);
+        assertTrue(pool.nullifierSpent(0xBEEF));
+    }
+
+    function test_authRegistry_hydrationRunsViaProxyAdminUpgradeAndCall() public {
+        _markAuthRegistryAsLegacyInitialized();
+
+        uint256 snapshotRoot = uint256(keccak256("upgrade-snapshot-root"));
+        TreeRootPair[] memory snapshotRoots = new TreeRootPair[](1);
+        snapshotRoots[0] = TreeRootPair({treeNumber: 0, root: snapshotRoot});
+
+        AuthRegistryV2 authRegistryV2Impl = new AuthRegistryV2(20);
+        address proxyAdmin = _getProxyAdmin(address(authRegistryProxy));
+        bytes memory initCalldata = abi.encodeCall(AuthRegistry.hydrateAuthRootAnchorsFromRoots, (snapshotRoots));
+
+        vm.prank(ProxyAdmin(proxyAdmin).owner());
+        ProxyAdmin(proxyAdmin)
+            .upgradeAndCall(
+                ITransparentUpgradeableProxy(address(authRegistryProxy)), address(authRegistryV2Impl), initCalldata
+            );
+
+        AuthRegistryV2 authRegistryV2 = AuthRegistryV2(address(authRegistryProxy));
+        uint64 supersededBlock = authRegistryV2.authTreeRootAnchors(0, snapshotRoot);
+        assertEq(supersededBlock, uint64(block.number), "snapshot root should be stamped as superseded");
+    }
+
     // ============ PrivacyBoost Tests ============
 
     function test_privacyBoost_initializationSucceeds() public view {
         assertEq(pool.owner(), owner);
+        assertEq(pool.gatewayRouteManager(), owner);
         assertEq(address(pool.tokenRegistry()), address(tokenRegistry));
         assertEq(address(pool.authRegistry()), address(authRegistry));
         assertEq(pool.maxBatchSize(), 8);
@@ -234,14 +383,46 @@ contract UpgradeableTest is Test {
         assertGt(pool.treeRoot(0), 0);
     }
 
+    function test_privacyBoost_gatewayRouteManagerMigratesAtomicallyViaProxyAdmin() public {
+        address routeManager = makeAddr("route-manager");
+        bytes32 managerSlot = bytes32(uint256(33));
+        vm.store(address(pool), managerSlot, bytes32(0));
+        assertEq(pool.gatewayRouteManager(), address(0));
+
+        PrivacyBoost newImpl =
+            new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 300, 64, 20);
+        address proxyAdmin = _getProxyAdmin(address(poolProxy));
+        bytes memory initCalldata = abi.encodeCall(PrivacyBoost.initializeGatewayRouteManager, (routeManager));
+
+        vm.prank(ProxyAdmin(proxyAdmin).owner());
+        ProxyAdmin(proxyAdmin)
+            .upgradeAndCall(ITransparentUpgradeableProxy(address(poolProxy)), address(newImpl), initCalldata);
+
+        assertEq(pool.gatewayRouteManager(), routeManager);
+    }
+
+    function test_privacyBoost_gatewayRouteManagerMigrationRejectsUnauthorizedCaller() public {
+        vm.prank(alice);
+        vm.expectRevert(IPrivacyBoost.NotGatewayRouteMigrationAdmin.selector);
+        pool.initializeGatewayRouteManager(makeAddr("route-manager"));
+    }
+
     function test_privacyBoost_reinitializationBlocked() public {
         vm.expectRevert();
-        pool.initialize(alice, address(verifier), address(verifier), address(verifier), 0, address(0), 300);
+        pool.initialize(
+            alice,
+            address(verifier),
+            address(verifier),
+            address(verifier),
+            address(verifier),
+            address(verifier),
+            0,
+            address(0)
+        );
     }
 
     function test_privacyBoost_statePreservedAfterUpgrade() public {
         // Set up some state
-        address relay = makeAddr("relay");
         address[] memory relays = new address[](1);
         relays[0] = relay;
         vm.prank(operator);
@@ -261,6 +442,8 @@ contract UpgradeableTest is Test {
             256, // cancelDelay
             256, // forcedWithdrawalDelay
             4, // maxForcedInputs
+            300, // maxEpochAuthStalenessBlocks
+            64, // maxForcedWithdrawalAuthStalenessBlocks
             20 // merkleDepth
         );
         address proxyAdmin = _getProxyAdmin(address(poolProxy));
@@ -294,6 +477,8 @@ contract UpgradeableTest is Test {
             256, // cancelDelay
             256, // forcedWithdrawalDelay
             4, // maxForcedInputs
+            300, // maxEpochAuthStalenessBlocks
+            64, // maxForcedWithdrawalAuthStalenessBlocks
             20 // merkleDepth
         );
         address proxyAdmin = _getProxyAdmin(address(poolProxy));
@@ -320,6 +505,8 @@ contract UpgradeableTest is Test {
             256, // cancelDelay
             256, // forcedWithdrawalDelay
             4, // maxForcedInputs
+            300, // maxEpochAuthStalenessBlocks
+            64, // maxForcedWithdrawalAuthStalenessBlocks
             20 // merkleDepth
         );
 
@@ -332,7 +519,16 @@ contract UpgradeableTest is Test {
         authRegistryImpl.initialize(owner);
 
         vm.expectRevert();
-        poolImpl.initialize(owner, address(verifier), address(verifier), address(verifier), 0, address(0), 300);
+        poolImpl.initialize(
+            owner,
+            address(verifier),
+            address(verifier),
+            address(verifier),
+            address(verifier),
+            address(verifier),
+            0,
+            address(0)
+        );
     }
 
     // ============ Storage Gap Tests ============

@@ -17,11 +17,26 @@
 pragma solidity 0.8.34;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
+import {EIP7702Utils} from "@openzeppelin/contracts/account/utils/EIP7702Utils.sol";
 import {TransparentUpgradeableProxy} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 import {AuthRegistry} from "src/AuthRegistry.sol";
+import {PortalDelegate} from "src/PortalDelegate.sol";
+import {DOMAIN_REG_NODE} from "src/interfaces/Constants.sol";
 import {IAuthRegistry} from "src/interfaces/IAuthRegistry.sol";
-import {EcdsaSig} from "src/interfaces/IStructs.sol";
+import {IPrivacyBoost} from "src/interfaces/IPrivacyBoost.sol";
+import {IWETH} from "src/interfaces/IWETH.sol";
+import {AuthRootStatus, EcdsaSig, TreeRootPair} from "src/interfaces/IStructs.sol";
+import {LibAuthZeroHashes} from "src/lib/LibAuthZeroHashes.sol";
+import {MockWETH} from "src/testnet/MockWETH.sol";
 import {MockERC7739Account} from "test/mocks/MockERC7739Account.sol";
+
+interface IAuthPoseidonHash {
+    function hash(uint256 len, uint256 a0, uint256 a1, uint256 a2, uint256 a3, uint256 a4)
+        external
+        pure
+        returns (uint256);
+}
 
 contract ERC1271WalletMock {
     bytes4 internal constant MAGIC_VALUE = 0x1626ba7e;
@@ -37,12 +52,23 @@ contract ERC1271WalletMock {
     }
 }
 
+/// @notice ERC-1271 implementation that rejects every signature. Installed as
+///         an EIP-7702 delegate it models an account whose delegate declines
+///         the raw digest, leaving the delegated EOA's own key as the only
+///         remaining authority over its auth keys.
+contract ERC1271RejectingWalletMock {
+    function isValidSignature(bytes32, bytes memory) external pure returns (bytes4) {
+        return bytes4(0xffffffff);
+    }
+}
+
 /// @notice Unit tests for AuthRegistry multi-tree support with nonce-based signatures
 contract AuthRegistryTest is Test {
     AuthRegistry registry;
     address owner = address(this);
     address proxyAdmin = address(0xAD); // Separate proxy admin to avoid TransparentProxy routing issue
     address operator = makeAddr("operator");
+    address server = makeAddr("server");
 
     // Valid BabyJubJub curve points (gnark BN254: a=-1, d=12181644...846)
     // B8 = 8 * Generator (cofactor-cleared base point)
@@ -64,6 +90,7 @@ contract AuthRegistryTest is Test {
     uint256 constant PK5Y = 19641326725043875799903403987343978153690949184340502090612493837393445612301;
 
     uint256 constant DEFAULT_SALT = 123;
+    uint256 constant DELEGATED_OWNER_PK = 0xA11CE;
 
     // EIP-712 domain constants (must match AuthRegistry)
     bytes32 private constant DOMAIN_TYPEHASH =
@@ -77,6 +104,7 @@ contract AuthRegistryTest is Test {
     );
     bytes32 private constant REVOKE_TYPEHASH =
         keccak256("Revoke(uint256 accountId,uint256 authPkX,uint64 expiry,uint256 nonce)");
+    bytes32 private constant INITIALIZABLE_STORAGE = 0xf0c57e16840df040f15088dc2f81fe391c3923bec73e23a9662efc9c229c6a00;
 
     function setUp() public {
         AuthRegistry impl = new AuthRegistry(20);
@@ -87,10 +115,67 @@ contract AuthRegistryTest is Test {
 
         // Set operator
         registry.setOperator(operator);
+
+        // The test contract acts as the default relay for happy-path writes.
+        address[] memory relays = new address[](1);
+        relays[0] = address(this);
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
     }
 
     function _domainSeparator() internal view returns (bytes32) {
         return keccak256(abi.encode(DOMAIN_TYPEHASH, NAME_HASH, VERSION_HASH, block.chainid, address(registry)));
+    }
+
+    function _markAsLegacyInitialized() internal {
+        vm.store(address(registry), INITIALIZABLE_STORAGE, bytes32(uint256(1)));
+        _openLegacyAnchorMigration();
+    }
+
+    function _openLegacyAnchorMigration() internal {
+        vm.store(address(registry), bytes32(uint256(10)), bytes32(0));
+    }
+
+    function _packAuthTreeStateTail(uint64 cursor, uint32 leafCount) internal pure returns (bytes32) {
+        return bytes32(uint256(cursor) | (uint256(leafCount) << 64));
+    }
+
+    function _manualSingleLeafRoot(uint256 leaf) internal view returns (uint256 current) {
+        uint256[21] memory zeros = LibAuthZeroHashes.get();
+        IAuthPoseidonHash poseidon = IAuthPoseidonHash(registry.authPoseidon());
+        current = leaf;
+        for (uint256 level = 0; level < 20; ++level) {
+            current = poseidon.hash(3, DOMAIN_REG_NODE, current, zeros[level], 0, 0);
+        }
+    }
+
+    function _manualTwoLeafRoot(uint256 leftLeaf, uint256 rightLeaf) internal view returns (uint256 current) {
+        uint256[21] memory zeros = LibAuthZeroHashes.get();
+        IAuthPoseidonHash poseidon = IAuthPoseidonHash(registry.authPoseidon());
+        current = poseidon.hash(3, DOMAIN_REG_NODE, leftLeaf, rightLeaf, 0, 0);
+        for (uint256 level = 1; level < 20; ++level) {
+            current = poseidon.hash(3, DOMAIN_REG_NODE, current, zeros[level], 0, 0);
+        }
+    }
+
+    function _manualRootForPrefix(uint256[] memory leaves, uint256 count) internal view returns (uint256 current) {
+        uint256[21] memory zeros = LibAuthZeroHashes.get();
+        IAuthPoseidonHash poseidon = IAuthPoseidonHash(registry.authPoseidon());
+        uint256[] memory level = new uint256[](16);
+        for (uint256 i = 0; i < level.length; ++i) {
+            level[i] = i < count ? leaves[i] : zeros[0];
+        }
+        uint256 width = level.length;
+        for (uint256 treeLevel = 0; treeLevel < 4; ++treeLevel) {
+            width /= 2;
+            for (uint256 i = 0; i < width; ++i) {
+                level[i] = poseidon.hash(3, DOMAIN_REG_NODE, level[2 * i], level[2 * i + 1], 0, 0);
+            }
+        }
+        current = level[0];
+        for (uint256 treeLevel = 4; treeLevel < 20; ++treeLevel) {
+            current = poseidon.hash(3, DOMAIN_REG_NODE, current, zeros[treeLevel], 0, 0);
+        }
     }
 
     function _signRegister(
@@ -196,7 +281,29 @@ contract AuthRegistryTest is Test {
     function test_constants() public view {
         assertEq(registry.authTreeDepth(), 20, "authTreeDepth should be 20");
         assertEq(registry.MAX_AUTH_TREE_NUMBER(), 32767, "MAX_AUTH_TREE_NUMBER should be 2^15 - 1");
-        assertEq(registry.AUTH_ROOT_HISTORY_SIZE(), 64, "AUTH_ROOT_HISTORY_SIZE should be 64");
+    }
+
+    function test_constructor_revertWhen_authTreeDepthOutOfRange() public {
+        vm.expectRevert(abi.encodeWithSelector(IAuthRegistry.AuthTreeDepthOutOfRange.selector, 0, 1, 20));
+        new AuthRegistry(0);
+
+        vm.expectRevert(abi.encodeWithSelector(IAuthRegistry.AuthTreeDepthOutOfRange.selector, 21, 1, 20));
+        new AuthRegistry(21);
+
+        // Boundary: depth 20 is accepted.
+        AuthRegistry maxDepth = new AuthRegistry(20);
+        assertEq(maxDepth.authTreeDepth(), 20, "depth 20 should be allowed");
+    }
+
+    function test_constructor_deploysPoseidonHelper() public view {
+        address helper = registry.authPoseidon();
+        uint256 accountId = registry.computeAccountId(owner, 123);
+        uint256 leaf = registry.computeLeaf(accountId, PK1X, PK1Y, uint64(block.timestamp + 1 days));
+
+        assertNotEq(helper, address(0));
+        assertGt(helper.code.length, 0);
+        assertNotEq(accountId, 0);
+        assertNotEq(leaf, 0);
     }
 
     // ============ Register Tests ============
@@ -213,14 +320,14 @@ contract AuthRegistryTest is Test {
         uint256 nonce = registry.nonces(accountId);
 
         bytes memory sig = _signRegister(privateKey, accountId, authPkX, authPkY, expiry, nonce);
+        bytes32 authKeyId = registry.computeAuthKeyId(accountId, authPkX);
 
         vm.expectEmit(true, true, true, true);
         emit IAuthRegistry.Registered(accountId, signer, 0, authPkX, authPkY, expiry);
-
-        vm.prank(signer);
+        vm.expectEmit(true, true, false, true);
+        emit IAuthRegistry.AuthKeyAdded(accountId, authKeyId, 0, authPkX, authPkY, expiry);
         registry.register(salt, authPkX, authPkY, expiry, signer, sig);
 
-        bytes32 authKeyId = registry.computeAuthKeyId(accountId, authPkX);
         assertEq(registry.ownerOf(accountId), signer, "Owner should be signer");
         assertEq(registry.authKeyTreeOf(authKeyId), 0, "Should be in tree 0");
         assertEq(registry.authKeyIndexOf(authKeyId), 0, "Should be at index 0");
@@ -238,12 +345,25 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, _legacySig(sig));
 
         assertEq(registry.ownerOf(accountId), signer, "Owner should be signer");
         assertEq(registry.nonces(accountId), 1, "Nonce should be incremented");
+    }
+
+    function test_register_owner_direct_success() public {
+        uint256 privateKey = 0x1234;
+        address signer = vm.addr(privateKey);
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(signer, salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+
+        vm.prank(signer);
+        registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
+
+        assertEq(registry.ownerOf(accountId), signer, "owner direct register should set owner");
+        assertEq(registry.nonces(accountId), 1, "owner direct register should increment nonce");
     }
 
     function test_register_multipleAccounts() public {
@@ -257,7 +377,6 @@ contract AuthRegistryTest is Test {
             uint256 nonce = registry.nonces(accountId);
 
             bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, nonce);
-            vm.prank(signer);
             registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
 
             bytes32 authKeyId = registry.computeAuthKeyId(accountId, PK1X);
@@ -276,12 +395,10 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
 
         // Try to register same authPkX again (different authPkY doesn't matter - authKeyId is based on authPkX)
         bytes memory sig2 = _signRegister(privateKey, accountId, PK1X, PK1Y_ALT, expiry, 1);
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.AlreadyRegistered.selector);
         registry.register(salt, PK1X, PK1Y_ALT, expiry, signer, sig2);
     }
@@ -292,19 +409,21 @@ contract AuthRegistryTest is Test {
         uint256 salt = DEFAULT_SALT;
         uint256 accountId = registry.computeAccountId(signer, salt);
         uint64 expiry = uint64(block.timestamp + 1 hours);
+        uint64 secondExpiry = uint64(block.timestamp + 2 hours);
 
         // Register first auth key
         bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         assertEq(registry.ownerOf(accountId), signer);
         assertEq(registry.getAuthKeys(accountId).length, 1);
 
         // Register second auth key (different authPkX) - should succeed
-        bytes memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
-        vm.prank(signer);
-        registry.register(salt, PK2X, PK2Y, expiry, signer, sig2);
+        bytes memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, secondExpiry, 1);
+        bytes32 authKeyId2 = registry.computeAuthKeyId(accountId, PK2X);
+        vm.expectEmit(true, true, false, true);
+        emit IAuthRegistry.AuthKeyAdded(accountId, authKeyId2, 0, PK2X, PK2Y, secondExpiry);
+        registry.register(salt, PK2X, PK2Y, secondExpiry, signer, sig2);
 
         assertEq(registry.ownerOf(accountId), signer);
         assertEq(registry.getAuthKeys(accountId).length, 2);
@@ -312,7 +431,6 @@ contract AuthRegistryTest is Test {
 
         // Verify both auth keys exist
         bytes32 authKeyId1 = registry.computeAuthKeyId(accountId, PK1X);
-        bytes32 authKeyId2 = registry.computeAuthKeyId(accountId, PK2X);
         assertEq(registry.authKeyTreeOf(authKeyId1), 0);
         assertEq(registry.authKeyIndexOf(authKeyId1), 0);
         assertEq(registry.authKeyTreeOf(authKeyId2), 0);
@@ -330,13 +448,11 @@ contract AuthRegistryTest is Test {
 
         // Register with first owner
         bytes memory sig1 = _signRegister(privateKey1, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer1);
         registry.register(salt, PK1X, PK1Y, expiry, signer1, sig1);
 
         // A different owner derives a different accountId for the same salt, so the signature
         // over signer1's accountId becomes invalid for signer2's registration attempt.
         bytes memory sig2 = _signRegister(privateKey2, accountId, PK2X, PK2Y, expiry, 1);
-        vm.prank(signer2);
         vm.expectRevert(IAuthRegistry.InvalidSignature.selector);
         registry.register(salt, PK2X, PK2Y, expiry, signer2, sig2);
     }
@@ -350,8 +466,6 @@ contract AuthRegistryTest is Test {
 
         // Sign with privateKey but call as wrongSigner (msg.sender == expectedOwner, but signature doesn't match)
         bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-
-        vm.prank(wrongSigner);
         vm.expectRevert(IAuthRegistry.InvalidSignature.selector);
         registry.register(salt, PK1X, PK1Y, expiry, wrongSigner, sig);
     }
@@ -367,8 +481,6 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp - 1); // Expired (999 < 1000)
 
         bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.SignatureExpired.selector);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
     }
@@ -382,10 +494,108 @@ contract AuthRegistryTest is Test {
         uint256 wrongNonce = 999; // Wrong nonce
 
         bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, wrongNonce);
-
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidSignature.selector);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
+    }
+
+    function test_appendLeaf_rootMatchesManualFold() public {
+        // Arrange
+        uint256 privateKey = 0xA551;
+        address signer = vm.addr(privateKey);
+        uint256 accountId = registry.computeAccountId(signer, DEFAULT_SALT);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        uint256 leaf = registry.computeLeaf(accountId, PK1X, PK1Y, expiry);
+        uint256 expectedRoot = _manualSingleLeafRoot(leaf);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+
+        // Act
+        registry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, signer, sig);
+
+        // Assert
+        assertEq(registry.authTreeRoot(0), expectedRoot);
+    }
+
+    function test_appendLeaf_oddIndexUsesLeftSibling() public {
+        // Arrange
+        uint256 firstPrivateKey = 0xA552;
+        uint256 secondPrivateKey = 0xA553;
+        address firstSigner = vm.addr(firstPrivateKey);
+        address secondSigner = vm.addr(secondPrivateKey);
+        uint256 firstAccountId = registry.computeAccountId(firstSigner, DEFAULT_SALT);
+        uint256 secondAccountId = registry.computeAccountId(secondSigner, DEFAULT_SALT);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        uint256 firstLeaf = registry.computeLeaf(firstAccountId, PK1X, PK1Y, expiry);
+        uint256 secondLeaf = registry.computeLeaf(secondAccountId, PK2X, PK2Y, expiry);
+        uint256 expectedRoot = _manualTwoLeafRoot(firstLeaf, secondLeaf);
+        bytes memory firstSig = _signRegister(firstPrivateKey, firstAccountId, PK1X, PK1Y, expiry, 0);
+        bytes memory secondSig = _signRegister(secondPrivateKey, secondAccountId, PK2X, PK2Y, expiry, 0);
+
+        // Act
+        registry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, firstSigner, firstSig);
+        registry.register(DEFAULT_SALT, PK2X, PK2Y, expiry, secondSigner, secondSig);
+
+        // Assert
+        assertEq(registry.authTreeRoot(0), expectedRoot);
+    }
+
+    function test_appendLeaf_sequenceMatchesIndependentFullTreeModel() public {
+        // Arrange
+        uint256[] memory leaves = new uint256[](9);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        for (uint256 i = 0; i < leaves.length; ++i) {
+            uint256 privateKey = 0xA600 + i;
+            address signer = vm.addr(privateKey);
+            uint256 accountId = registry.computeAccountId(signer, DEFAULT_SALT);
+            leaves[i] = registry.computeLeaf(accountId, PK1X, PK1Y, expiry);
+        }
+
+        // Act / Assert
+        for (uint256 i = 0; i < leaves.length; ++i) {
+            uint256 privateKey = 0xA600 + i;
+            address signer = vm.addr(privateKey);
+            uint256 accountId = registry.computeAccountId(signer, DEFAULT_SALT);
+            bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+            registry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, signer, sig);
+
+            assertEq(registry.authTreeRoot(0), _manualRootForPrefix(leaves, i + 1), "append root mismatch");
+        }
+    }
+
+    function test_updateLeaf_indexFourMatchesIndependentFullTreeModel() public {
+        // Arrange
+        uint256[] memory leaves = new uint256[](9);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        uint256 targetPrivateKey;
+        uint256 targetAccountId;
+        for (uint256 i = 0; i < leaves.length; ++i) {
+            uint256 privateKey = 0xA700 + i;
+            address signer = vm.addr(privateKey);
+            uint256 accountId = registry.computeAccountId(signer, DEFAULT_SALT);
+            leaves[i] = registry.computeLeaf(accountId, PK1X, PK1Y, expiry);
+            bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+            registry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, signer, sig);
+            if (i == 4) {
+                targetPrivateKey = privateKey;
+                targetAccountId = accountId;
+            }
+        }
+        uint64 newExpiry = expiry + 1 hours;
+        bytes memory rotateSig = _signRotate(targetPrivateKey, targetAccountId, PK1X, PK2X, PK2Y, newExpiry, 1);
+
+        // Act
+        registry.rotate(targetAccountId, PK1X, PK2X, PK2Y, newExpiry, rotateSig);
+        leaves[4] = registry.computeLeaf(targetAccountId, PK2X, PK2Y, newExpiry);
+
+        // Assert
+        assertEq(registry.authTreeRoot(0), _manualRootForPrefix(leaves, leaves.length));
+
+        // Act
+        bytes memory revokeSig = _signRevoke(targetPrivateKey, targetAccountId, PK2X, newExpiry, 2);
+        registry.revoke(targetAccountId, PK2X, newExpiry, revokeSig);
+        leaves[4] = 0;
+
+        // Assert
+        assertEq(registry.authTreeRoot(0), _manualRootForPrefix(leaves, leaves.length));
     }
 
     // ============ Rotate Tests ============
@@ -402,7 +612,6 @@ contract AuthRegistryTest is Test {
 
         // First register
         bytes memory regSig = _signRegister(privateKey, accountId, authPkX, authPkY, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, authPkX, authPkY, expiry, signer, regSig);
 
         uint256 rootAfterRegister = registry.authTreeRoot(0);
@@ -414,9 +623,9 @@ contract AuthRegistryTest is Test {
         uint256 rotateNonce = registry.nonces(accountId); // Should be 1
         bytes memory rotSig =
             _signRotate(privateKey, accountId, authPkX, newAuthPkX, newAuthPkY, newExpiry, rotateNonce);
-
-        vm.prank(signer);
         registry.rotate(accountId, authPkX, newAuthPkX, newAuthPkY, newExpiry, rotSig);
+
+        uint256 expectedRoot = _manualSingleLeafRoot(registry.computeLeaf(accountId, newAuthPkX, newAuthPkY, newExpiry));
 
         // Owner should remain the same
         assertEq(registry.ownerOf(accountId), signer);
@@ -428,10 +637,56 @@ contract AuthRegistryTest is Test {
         bytes32 oldAuthKeyId = registry.computeAuthKeyId(accountId, authPkX);
         assertEq(registry.authKeyTreeOf(oldAuthKeyId), 0);
         assertEq(registry.authKeyIndexOf(oldAuthKeyId), 0);
-        // Root should change
-        assertNotEq(registry.authTreeRoot(0), rootAfterRegister);
+        // Root should match the exact replacement leaf fold.
+        assertNotEq(expectedRoot, rootAfterRegister);
+        assertEq(registry.authTreeRoot(0), expectedRoot);
         // Nonce should increment
         assertEq(registry.nonces(accountId), 2);
+    }
+
+    function test_currentAuthLeafAt_tracksRegisterRotateAndRevoke() public {
+        uint256 privateKey = 0x1234;
+        address signer = vm.addr(privateKey);
+        uint256 accountId = registry.computeAccountId(signer, DEFAULT_SALT);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        uint256 firstLeaf = registry.computeLeaf(accountId, PK1X, PK1Y, expiry);
+        bytes memory registerSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        registry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, signer, registerSig);
+
+        assertTrue(registry.isCurrentAuthLeafAt(0, firstLeaf));
+        assertFalse(registry.isCurrentAuthLeafAt(1, firstLeaf));
+
+        uint256 secondLeaf = registry.computeLeaf(accountId, PK2X, PK2Y, expiry);
+        bytes memory rotateSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
+        registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, rotateSig);
+
+        assertFalse(registry.isCurrentAuthLeafAt(0, firstLeaf));
+        assertTrue(registry.isCurrentAuthLeafAt(0, secondLeaf));
+
+        bytes memory revokeSig = _signRevoke(privateKey, accountId, PK2X, expiry, 2);
+        registry.revoke(accountId, PK2X, expiry, revokeSig);
+
+        assertFalse(registry.isCurrentAuthLeafAt(0, secondLeaf));
+    }
+
+    function test_rotate_owner_direct_success() public {
+        uint256 privateKey = 0x1234;
+        address signer = vm.addr(privateKey);
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(signer, salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
+
+        bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
+        vm.prank(signer);
+        registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, rotSig);
+
+        bytes32 newAuthKeyId = registry.computeAuthKeyId(accountId, PK2X);
+        assertEq(registry.authKeyIndexOf(newAuthKeyId), 0, "owner direct rotate should reuse slot");
+        assertEq(registry.nonces(accountId), 2, "owner direct rotate should increment nonce");
     }
 
     function test_rotateAndRevoke_legacyEcdsaSigTuple_success() public {
@@ -443,16 +698,13 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, _legacySig(regSig));
 
         bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
-        vm.prank(signer);
         registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, _legacySig(rotSig));
         assertEq(registry.nonces(accountId), 2, "Nonce should increment after rotate");
 
         bytes memory revokeSig = _signRevoke(privateKey, accountId, PK2X, expiry, 2);
-        vm.prank(signer);
         registry.revoke(accountId, PK2X, expiry, _legacySig(revokeSig));
 
         bytes32 newAuthKeyId = registry.computeAuthKeyId(accountId, PK2X);
@@ -473,8 +725,6 @@ contract AuthRegistryTest is Test {
         registry.setAllowedRelays(relays, true);
 
         bytes memory sig = _signRotate(privateKey, accountId, 111, PK1X, PK1Y, expiry, 0);
-
-        vm.prank(relay);
         vm.expectRevert(IAuthRegistry.NotRegistered.selector);
         registry.rotate(accountId, 111, PK1X, PK1Y, expiry, sig);
     }
@@ -488,12 +738,10 @@ contract AuthRegistryTest is Test {
 
         // Register one auth key
         bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         // Try to rotate non-existent auth key
         bytes memory rotSig = _signRotate(privateKey, accountId, 999, 666, 777, expiry, 1);
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.AuthKeyNotFound.selector);
         registry.rotate(accountId, 999, 666, 777, expiry, rotSig); // oldAuthPkX = 999 doesn't exist
     }
@@ -507,16 +755,13 @@ contract AuthRegistryTest is Test {
 
         // Register two auth keys: 222 and 444
         bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         bytes memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
-        vm.prank(signer);
         registry.register(salt, PK2X, PK2Y, expiry, signer, sig2);
 
         // Try to rotate auth key 222 → 444 (444 already exists)
         bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 2);
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.AlreadyRegistered.selector);
         registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, rotSig);
     }
@@ -532,13 +777,10 @@ contract AuthRegistryTest is Test {
 
         // Register with privateKey
         bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         // Try to rotate with wrongPrivateKey (but calling as correct owner)
         bytes memory rotSig = _signRotate(wrongPrivateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
-
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidSignature.selector);
         registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, rotSig);
     }
@@ -555,14 +797,11 @@ contract AuthRegistryTest is Test {
 
         // Register
         bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         // Try to rotate with expired signature
         uint64 expiredExpiry = uint64(block.timestamp - 1); // 999 < 1000
         bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiredExpiry, 1);
-
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.SignatureExpired.selector);
         registry.rotate(accountId, PK1X, PK2X, PK2Y, expiredExpiry, rotSig);
     }
@@ -576,16 +815,13 @@ contract AuthRegistryTest is Test {
 
         // Register
         bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         // Rotate once
         bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
-        vm.prank(signer);
         registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, rotSig);
 
         // Try to replay the same signature (nonce is now 2, but sig was for nonce 1)
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidSignature.selector);
         registry.rotate(accountId, PK2X, PK2X, PK2Y, expiry, rotSig);
     }
@@ -599,11 +835,9 @@ contract AuthRegistryTest is Test {
 
         // Register two auth keys: 222 and 444
         bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         bytes memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
-        vm.prank(signer);
         registry.register(salt, PK2X, PK2Y, expiry, signer, sig2);
 
         // Sign rotate for key 222 → 666 (oldAuthPkX = 222)
@@ -611,7 +845,6 @@ contract AuthRegistryTest is Test {
 
         // Try to use same signature to rotate key 444 → 666 (oldAuthPkX = 444)
         // This should fail because the signature binds oldAuthPkX = 222
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidSignature.selector);
         registry.rotate(accountId, PK2X, 666, 777, expiry, rotSig);
     }
@@ -634,13 +867,86 @@ contract AuthRegistryTest is Test {
         uint256 rootBefore = registry.authTreeRoot(0);
 
         bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
 
         uint256[] memory roots = registry.getAllAuthTreeRoots();
         assertEq(roots.length, 1, "Should still return 1 tree");
         assertNotEq(roots[0], rootBefore, "Root should change after register");
         assertEq(roots[0], registry.authTreeRoot(0));
+    }
+
+    // ============ getAuthRootStatuses Tests ============
+
+    function test_getAuthRootStatuses_currentRoot() public view {
+        uint256 currentRoot = registry.authTreeRoot(0);
+        TreeRootPair[] memory roots = new TreeRootPair[](1);
+        roots[0] = TreeRootPair({treeNumber: 0, root: currentRoot});
+
+        (uint64 blockNumber, uint256 currentTreeNumber, AuthRootStatus[] memory statuses) =
+            registry.getAuthRootStatuses(roots, 64);
+
+        assertEq(blockNumber, uint64(block.number), "block number should match");
+        assertEq(currentTreeNumber, 0, "current tree should be 0");
+        assertEq(statuses.length, 1, "one status");
+        assertEq(statuses[0].treeNumber, 0, "tree number");
+        assertEq(statuses[0].root, currentRoot, "root");
+        assertTrue(statuses[0].isCurrent, "current root should be current");
+        assertTrue(statuses[0].isRecent, "current root should be recent");
+        assertEq(statuses[0].supersededBlock, 0, "current root should not be superseded");
+        assertEq(statuses[0].remainingBlocks, type(uint64).max, "current root should not expire");
+    }
+
+    function test_getAuthRootStatuses_supersededFreshAndExpiredRoot() public {
+        uint256 privateKey = 0x1234;
+        address signer = vm.addr(privateKey);
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(signer, salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        uint256 previousRoot = registry.authTreeRoot(0);
+
+        vm.roll(100);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
+        uint256 currentRoot = registry.authTreeRoot(0);
+
+        TreeRootPair[] memory roots = new TreeRootPair[](2);
+        roots[0] = TreeRootPair({treeNumber: 0, root: previousRoot});
+        roots[1] = TreeRootPair({treeNumber: 0, root: currentRoot});
+
+        vm.roll(120);
+        (, uint256 currentTreeNumber, AuthRootStatus[] memory freshStatuses) = registry.getAuthRootStatuses(roots, 64);
+        assertEq(currentTreeNumber, 0, "current tree should be 0");
+        assertFalse(freshStatuses[0].isCurrent, "old root is not current");
+        assertTrue(freshStatuses[0].isRecent, "old root should still be recent");
+        assertEq(freshStatuses[0].supersededBlock, 100, "old root superseded block");
+        assertEq(freshStatuses[0].remainingBlocks, 44, "old root remaining window");
+        assertTrue(freshStatuses[1].isCurrent, "new root is current");
+        assertTrue(freshStatuses[1].isRecent, "new root is recent");
+
+        vm.roll(165);
+        (,, AuthRootStatus[] memory expiredStatuses) = registry.getAuthRootStatuses(roots, 64);
+        assertFalse(expiredStatuses[0].isCurrent, "expired root is not current");
+        assertFalse(expiredStatuses[0].isRecent, "expired root is not recent");
+        assertEq(expiredStatuses[0].supersededBlock, 100, "expired root superseded block");
+        assertEq(expiredStatuses[0].remainingBlocks, 0, "expired root remaining window");
+    }
+
+    function test_getAuthRootStatuses_zeroAndFutureTreeRoots() public view {
+        TreeRootPair[] memory roots = new TreeRootPair[](2);
+        roots[0] = TreeRootPair({treeNumber: 0, root: 0});
+        roots[1] = TreeRootPair({treeNumber: 99, root: registry.authTreeRoot(0)});
+
+        (, uint256 currentTreeNumber, AuthRootStatus[] memory statuses) = registry.getAuthRootStatuses(roots, 64);
+
+        assertEq(currentTreeNumber, 0, "current tree should be 0");
+        assertEq(statuses.length, 2, "two statuses");
+        assertEq(statuses[0].treeNumber, 0, "zero status preserves tree");
+        assertEq(statuses[0].root, 0, "zero status preserves root");
+        assertFalse(statuses[0].isCurrent, "zero root is not current");
+        assertFalse(statuses[0].isRecent, "zero root is not recent");
+        assertEq(statuses[1].treeNumber, 99, "future status preserves tree");
+        assertFalse(statuses[1].isCurrent, "future tree is not current");
+        assertFalse(statuses[1].isRecent, "future tree is not recent");
     }
 
     // ============ registryRoot (backwards compatibility) Tests ============
@@ -678,8 +984,6 @@ contract AuthRegistryTest is Test {
         // Expect RootUpdated event with treeNumber = 0
         vm.expectEmit(true, false, false, false);
         emit IAuthRegistry.RootUpdated(0, 0); // Only check indexed treeNumber
-
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
     }
 
@@ -695,7 +999,6 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
 
         bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
 
         // authKeyTreeOf should return the tree number where the auth key was registered
@@ -715,7 +1018,6 @@ contract AuthRegistryTest is Test {
             uint256 nonce = registry.nonces(accountId);
 
             bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, nonce);
-            vm.prank(signer);
             registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
 
             bytes32 authKeyId = registry.computeAuthKeyId(accountId, PK1X);
@@ -736,19 +1038,16 @@ contract AuthRegistryTest is Test {
 
         // Register increments nonce
         bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
         assertEq(registry.nonces(accountId), 1);
 
         // Rotate increments nonce
         bytes memory rotSig1 = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
-        vm.prank(signer);
         registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, rotSig1);
         assertEq(registry.nonces(accountId), 2);
 
         // Another rotate increments nonce again
         bytes memory rotSig2 = _signRotate(privateKey, accountId, PK2X, PK3X, PK3Y, expiry, 2);
-        vm.prank(signer);
         registry.rotate(accountId, PK2X, PK3X, PK3Y, expiry, rotSig2);
         assertEq(registry.nonces(accountId), 3);
     }
@@ -764,19 +1063,16 @@ contract AuthRegistryTest is Test {
 
         // Register first auth key (nonce 0)
         bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
         assertEq(registry.nonces(accountId), 1);
 
         // Register second auth key (nonce 1)
         bytes memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
-        vm.prank(signer);
         registry.register(salt, PK2X, PK2Y, expiry, signer, sig2);
         assertEq(registry.nonces(accountId), 2);
 
         // Rotate first auth key (nonce 2)
         bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK3X, PK3Y, expiry, 2);
-        vm.prank(signer);
         registry.rotate(accountId, PK1X, PK3X, PK3Y, expiry, rotSig);
         assertEq(registry.nonces(accountId), 3);
     }
@@ -794,7 +1090,6 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 days);
 
         bytes memory sig = _signRegister(privateKey, accountId, authPkX, authPkY, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, authPkX, authPkY, expiry, signer, sig);
 
         assertEq(registry.ownerOf(accountId), signer);
@@ -828,11 +1123,22 @@ contract AuthRegistryTest is Test {
 
         // First register
         bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         // Try to rotate as notAuthorized (not owner and not relay)
         bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 1);
+        vm.prank(notAuthorized);
+        vm.expectRevert(IAuthRegistry.NotAuthorized.selector);
+        registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, rotSig);
+    }
+
+    function test_rotate_notAuthorized_beforeNotRegistered_reverts() public {
+        uint256 privateKey = 0x1234;
+        address notAuthorized = address(0xDEAD);
+        uint256 accountId = 111;
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, 0);
+
         vm.prank(notAuthorized);
         vm.expectRevert(IAuthRegistry.NotAuthorized.selector);
         registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, rotSig);
@@ -937,9 +1243,6 @@ contract AuthRegistryTest is Test {
 
         bytes memory sig = _signRegister(privateKey, accountId, authPkX, authPkY, expiry, nonce);
 
-        vm.expectEmit(true, true, true, true);
-        emit IAuthRegistry.Registered(accountId, signer, 0, authPkX, authPkY, expiry);
-
         vm.prank(relay);
         registry.register(salt, authPkX, authPkY, expiry, signer, sig);
 
@@ -947,6 +1250,7 @@ contract AuthRegistryTest is Test {
         assertEq(registry.ownerOf(accountId), signer);
         assertEq(registry.authKeyTreeOf(authKeyId), 0);
         assertEq(registry.authKeyIndexOf(authKeyId), 0);
+        assertEq(registry.authTreeCount(0), 1);
     }
 
     function test_rotate_allowedRelay_success() public {
@@ -966,7 +1270,6 @@ contract AuthRegistryTest is Test {
 
         // First register (using relay)
         bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         // Now rotate (using relay)
@@ -978,11 +1281,14 @@ contract AuthRegistryTest is Test {
         vm.prank(relay);
         registry.rotate(accountId, PK1X, newAuthPkX, newAuthPkY, expiry, rotSig);
 
-        assertEq(registry.ownerOf(accountId), signer);
+        bytes32 oldAuthKeyId = registry.computeAuthKeyId(accountId, PK1X);
+        bytes32 newAuthKeyId = registry.computeAuthKeyId(accountId, newAuthPkX);
+        assertEq(registry.authKeyIndexOf(oldAuthKeyId), 0);
+        assertEq(registry.authKeyIndexOf(newAuthKeyId), 0);
         assertEq(registry.nonces(accountId), 2);
     }
 
-    function test_register_relay_invalidSignature_reverts() public {
+    function test_register_allowedRelay_invalidSignature_reverts() public {
         address relay = address(0xBEEF);
         uint256 privateKey = 0x1234;
         address wrongSigner = vm.addr(0x5678);
@@ -999,7 +1305,6 @@ contract AuthRegistryTest is Test {
 
         // Sign with privateKey but claim wrongSigner as expectedOwner
         bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-
         vm.prank(relay);
         vm.expectRevert(IAuthRegistry.InvalidSignature.selector);
         registry.register(salt, PK1X, PK1Y, expiry, wrongSigner, sig);
@@ -1020,8 +1325,6 @@ contract AuthRegistryTest is Test {
         bytes memory sig = hex"1271c0ffee";
         bytes32 digest = _registerDigest(accountId, PK1X, PK1Y, expiry, 0);
         wallet.approveSignature(digest, sig);
-
-        vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
 
         bytes32 authKeyId = registry.computeAuthKeyId(accountId, PK1X);
@@ -1043,8 +1346,6 @@ contract AuthRegistryTest is Test {
         uint256 salt = DEFAULT_SALT;
         uint64 expiry = uint64(block.timestamp + 1 hours);
         bytes memory sig = hex"bad01271";
-
-        vm.prank(relay);
         vm.expectRevert(IAuthRegistry.InvalidSignatureLength.selector);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
     }
@@ -1061,8 +1362,6 @@ contract AuthRegistryTest is Test {
         uint256 salt = DEFAULT_SALT;
         uint64 expiry = uint64(block.timestamp + 1 hours);
         bytes memory sig = new bytes(131);
-
-        vm.prank(relay);
         vm.expectRevert(IAuthRegistry.InvalidSignatureLength.selector);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
     }
@@ -1157,8 +1456,6 @@ contract AuthRegistryTest is Test {
         bytes memory sig = _buildErc7739Sig(_domainSeparator(), contentsHash);
         bytes32 expectedWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), contentsHash));
         wallet.approveSignature(expectedWrapped, sig);
-
-        vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
 
         assertEq(registry.ownerOf(accountId), address(wallet));
@@ -1182,8 +1479,6 @@ contract AuthRegistryTest is Test {
         bytes memory sig = _buildErc7739Sig(_domainSeparator(), rawDigest);
         bytes32 expectedWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), rawDigest));
         wallet.approveSignature(expectedWrapped, sig);
-
-        vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
 
         assertEq(registry.ownerOf(accountId), address(wallet));
@@ -1208,8 +1503,6 @@ contract AuthRegistryTest is Test {
         assertEq(sig.length - 66 - 23, 1, "sanity: one-byte opaque prefix");
         bytes32 expectedWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), rawDigest));
         wallet.approveSignature(expectedWrapped, sig);
-
-        vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
 
         assertEq(registry.ownerOf(accountId), address(wallet));
@@ -1232,8 +1525,6 @@ contract AuthRegistryTest is Test {
         bytes32 rawDigest = _registerDigest(accountId, PK1X, PK1Y, expiry, 0);
         bytes memory sig = _buildErc7739SigWithoutInner(_domainSeparator(), rawDigest);
         assertEq(sig.length, 66 + 23, "sanity: appendix-only sig");
-
-        vm.prank(relay);
         vm.expectRevert(IAuthRegistry.InvalidSignatureLength.selector);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
     }
@@ -1259,8 +1550,6 @@ contract AuthRegistryTest is Test {
         bytes memory innerSig = abi.encodePacked(r, s, v);
         bytes memory sig =
             abi.encodePacked(innerSig, _domainSeparator(), rawDigest, bytes("Contents(bytes32 stuff)"), uint16(23));
-
-        vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
 
         assertEq(registry.ownerOf(accountId), address(wallet));
@@ -1293,8 +1582,6 @@ contract AuthRegistryTest is Test {
         // never sees a hash it recognises.
         bytes32 wouldBeWrapped = keccak256(abi.encodePacked(hex"1901", wrongSep, contentsHash));
         wallet.approveSignature(wouldBeWrapped, sig);
-
-        vm.prank(relay);
         vm.expectRevert(IAuthRegistry.InvalidERC7739AppDomain.selector);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
     }
@@ -1325,8 +1612,6 @@ contract AuthRegistryTest is Test {
 
         uint256 salt = DEFAULT_SALT;
         uint64 expiry = uint64(block.timestamp + 1 hours);
-
-        vm.prank(relay);
         vm.expectRevert(IAuthRegistry.InvalidERC7739ContentsHash.selector);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
     }
@@ -1353,8 +1638,6 @@ contract AuthRegistryTest is Test {
             _buildErc7739SigWithDescription(_domainSeparator(), contentsHash, "MailDigest(bytes32 stuff)");
         bytes32 wouldBeWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), contentsHash));
         wallet.approveSignature(wouldBeWrapped, sig);
-
-        vm.prank(relay);
         vm.expectRevert(IAuthRegistry.InvalidSignatureLength.selector);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
     }
@@ -1384,8 +1667,6 @@ contract AuthRegistryTest is Test {
         bytes memory sig = _buildErc7739SigWithDescription(_domainSeparator(), contentsHash, "Contentz(bytes32 stuff)");
         bytes32 wouldBeWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), contentsHash));
         wallet.approveSignature(wouldBeWrapped, sig);
-
-        vm.prank(relay);
         vm.expectRevert(IAuthRegistry.InvalidERC7739ContentsDescription.selector);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
     }
@@ -1406,8 +1687,6 @@ contract AuthRegistryTest is Test {
         bytes32 registerStructHash = keccak256(abi.encode(REGISTER_TYPEHASH, accountId, PK1X, PK1Y, expiry, uint256(0)));
         bytes32 contentsHash = _erc7739BoundContentsHash(registerStructHash);
         bytes memory sig = _buildErc7739Sig(_domainSeparator(), contentsHash);
-
-        vm.prank(relay);
         vm.expectRevert(IAuthRegistry.InvalidERC7739WrappedSignature.selector);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
     }
@@ -1440,7 +1719,6 @@ contract AuthRegistryTest is Test {
         // Attacker submits register(PK2) using the captured sig. On-chain,
         // expectedContentsHash is derived from the PK2 struct hash so does
         // not match capturedContentsHash, so the fallback rejects.
-        vm.prank(relay);
         vm.expectRevert(IAuthRegistry.InvalidERC7739ContentsHash.selector);
         registry.register(salt, PK2X, PK2Y, expiry, address(wallet), capturedSig);
     }
@@ -1465,8 +1743,6 @@ contract AuthRegistryTest is Test {
         bytes memory capturedSig = _buildErc7739Sig(_domainSeparator(), capturedRawDigest);
         bytes32 capturedWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), capturedRawDigest));
         wallet.approveSignature(capturedWrapped, capturedSig);
-
-        vm.prank(relay);
         vm.expectRevert(IAuthRegistry.InvalidERC7739ContentsHash.selector);
         registry.register(salt, PK2X, PK2Y, expiry, address(wallet), capturedSig);
     }
@@ -1493,8 +1769,6 @@ contract AuthRegistryTest is Test {
         bytes memory capturedSig = _buildErc7739Sig(_domainSeparator(), capturedContentsHash);
         bytes32 capturedWrapped = keccak256(abi.encodePacked(hex"1901", _domainSeparator(), capturedContentsHash));
         wallet.approveSignature(capturedWrapped, capturedSig);
-
-        vm.prank(relay);
         vm.expectRevert(IAuthRegistry.InvalidERC7739ContentsHash.selector);
         registry.register(salt, PK1X, PK1Y, expiry2, address(wallet), capturedSig);
     }
@@ -1524,8 +1798,6 @@ contract AuthRegistryTest is Test {
         wallet.approveSignature(
             keccak256(abi.encodePacked(hex"1901", _domainSeparator(), registerContentsHash)), registerSig
         );
-
-        vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), registerSig);
         assertEq(registry.ownerOf(accountId), address(wallet));
 
@@ -1534,7 +1806,6 @@ contract AuthRegistryTest is Test {
         // hash (different typehash + different fields + nonce=1 now); it
         // won't match the captured Register-bound contentsHash, so the
         // fallback rejects.
-        vm.prank(relay);
         vm.expectRevert(IAuthRegistry.InvalidERC7739ContentsHash.selector);
         registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, registerSig);
     }
@@ -1562,8 +1833,6 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
         bytes32 rawDigest = _registerDigest(accountId, PK1X, PK1Y, expiry, 0);
         wallet.approveSignature(rawDigest, sig);
-
-        vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
 
         assertEq(registry.ownerOf(accountId), address(wallet));
@@ -1594,8 +1863,6 @@ contract AuthRegistryTest is Test {
         uint64 expiry = uint64(block.timestamp + 1 hours);
         bytes32 rawDigest = _registerDigest(accountId, PK1X, PK1Y, expiry, 0);
         wallet.approveSignature(rawDigest, sig);
-
-        vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), sig);
 
         assertEq(registry.ownerOf(accountId), address(wallet));
@@ -1617,13 +1884,11 @@ contract AuthRegistryTest is Test {
 
         bytes memory registerSig = hex"127101";
         wallet.approveSignature(_registerDigest(accountId, PK1X, PK1Y, expiry, 0), registerSig);
-        vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, address(wallet), registerSig);
 
         uint64 newExpiry = uint64(block.timestamp + 2 hours);
         bytes memory rotateSig = hex"12710202";
         wallet.approveSignature(_rotateDigest(accountId, PK1X, PK2X, PK2Y, newExpiry, 1), rotateSig);
-        vm.prank(relay);
         registry.rotate(accountId, PK1X, PK2X, PK2Y, newExpiry, rotateSig);
 
         bytes32 newAuthKeyId = registry.computeAuthKeyId(accountId, PK2X);
@@ -1632,7 +1897,6 @@ contract AuthRegistryTest is Test {
 
         bytes memory revokeSig = hex"1271030303";
         wallet.approveSignature(_revokeDigest(accountId, PK2X, newExpiry, 2), revokeSig);
-        vm.prank(relay);
         registry.revoke(accountId, PK2X, newExpiry, revokeSig);
 
         assertTrue(registry.authKeyRevoked(newAuthKeyId));
@@ -1656,7 +1920,6 @@ contract AuthRegistryTest is Test {
 
         // Register using relay (should succeed)
         bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         assertEq(registry.ownerOf(accountId), signer);
@@ -1669,7 +1932,6 @@ contract AuthRegistryTest is Test {
         // Try to rotate using disabled relay (should revert with NotAuthorized)
         uint256 rotateNonce = registry.nonces(accountId);
         bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, expiry, rotateNonce);
-
         vm.prank(relay);
         vm.expectRevert(IAuthRegistry.NotAuthorized.selector);
         registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, rotSig);
@@ -1698,6 +1960,176 @@ contract AuthRegistryTest is Test {
         assertFalse(registry.allowedRelays(address(0xBEEF)));
     }
 
+    function _attachPortalDelegation(uint256 privateKey) internal returns (address delegatedOwner) {
+        MockWETH weth = new MockWETH();
+        PortalDelegate delegateImpl = new PortalDelegate(IPrivacyBoost(makeAddr("portalPool")), IWETH(address(weth)));
+        delegatedOwner = vm.addr(privateKey);
+        vm.signAndAttachDelegation(address(delegateImpl), privateKey);
+        assertEq(EIP7702Utils.fetchDelegate(delegatedOwner), address(delegateImpl));
+    }
+
+    // ============ EIP-7702 Delegated Owner Tests ============
+
+    function test_register_eip7702DelegatedOwner_directOwner_success() public {
+        // Arrange
+        address delegatedOwner = _attachPortalDelegation(DELEGATED_OWNER_PK);
+        uint256 accountId = registry.computeAccountId(delegatedOwner, DEFAULT_SALT);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory sig = _signRegister(DELEGATED_OWNER_PK, accountId, PK1X, PK1Y, expiry, 0);
+
+        // Act
+        vm.prank(delegatedOwner);
+        registry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, delegatedOwner, sig);
+
+        // Assert
+        assertEq(registry.ownerOf(accountId), delegatedOwner);
+        assertEq(registry.nonces(accountId), 1);
+    }
+
+    function test_rotate_eip7702DelegatedOwner_directOwner_success() public {
+        // Arrange
+        address delegatedOwner = _attachPortalDelegation(DELEGATED_OWNER_PK);
+        uint256 accountId = registry.computeAccountId(delegatedOwner, DEFAULT_SALT);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory registerSig = _signRegister(DELEGATED_OWNER_PK, accountId, PK1X, PK1Y, expiry, 0);
+        registry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, delegatedOwner, registerSig);
+        bytes memory rotateSig = _signRotate(DELEGATED_OWNER_PK, accountId, PK1X, PK2X, PK2Y, expiry, 1);
+
+        // Act
+        vm.prank(delegatedOwner);
+        registry.rotate(accountId, PK1X, PK2X, PK2Y, expiry, rotateSig);
+
+        // Assert
+        bytes32 newAuthKeyId = registry.computeAuthKeyId(accountId, PK2X);
+        assertEq(registry.authKeyIndexOf(newAuthKeyId), 0);
+        assertEq(registry.nonces(accountId), 2);
+    }
+
+    function test_revoke_eip7702DelegatedOwner_directOwner_success() public {
+        // Arrange
+        address delegatedOwner = _attachPortalDelegation(DELEGATED_OWNER_PK);
+        uint256 accountId = registry.computeAccountId(delegatedOwner, DEFAULT_SALT);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory registerSig = _signRegister(DELEGATED_OWNER_PK, accountId, PK1X, PK1Y, expiry, 0);
+        registry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, delegatedOwner, registerSig);
+        bytes memory revokeSig = _signRevoke(DELEGATED_OWNER_PK, accountId, PK1X, expiry, 1);
+        bytes32 authKeyId = registry.computeAuthKeyId(accountId, PK1X);
+
+        // Act
+        vm.prank(delegatedOwner);
+        registry.revoke(accountId, PK1X, expiry, revokeSig);
+
+        // Assert
+        assertTrue(registry.authKeyRevoked(authKeyId));
+        assertEq(registry.nonces(accountId), 2);
+    }
+
+    function test_register_eip7702DelegatedOwner_wrongSigner_reverts() public {
+        // Arrange
+        address delegatedOwner = _attachPortalDelegation(DELEGATED_OWNER_PK);
+        uint256 accountId = registry.computeAccountId(delegatedOwner, DEFAULT_SALT);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory wrongSig = _signRegister(0xB0B, accountId, PK1X, PK1Y, expiry, 0);
+
+        // Act
+        vm.startPrank(delegatedOwner);
+        vm.expectRevert(IAuthRegistry.InvalidSignatureLength.selector);
+        registry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, delegatedOwner, wrongSig);
+        vm.stopPrank();
+
+        // Assert
+        assertEq(registry.ownerOf(accountId), address(0));
+        assertEq(registry.nonces(accountId), 0);
+    }
+
+    function test_register_eip7702DelegatedOwner_legacyEcdsaSigTuple_success() public {
+        // Arrange
+        address delegatedOwner = _attachPortalDelegation(DELEGATED_OWNER_PK);
+        uint256 accountId = registry.computeAccountId(delegatedOwner, DEFAULT_SALT);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory sig = _signRegister(DELEGATED_OWNER_PK, accountId, PK1X, PK1Y, expiry, 0);
+
+        // Act
+        vm.prank(delegatedOwner);
+        registry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, delegatedOwner, _legacySig(sig));
+
+        // Assert
+        assertEq(registry.ownerOf(accountId), delegatedOwner);
+        assertEq(registry.nonces(accountId), 1);
+    }
+
+    function test_register_eip7702DelegatedOwner_allowedRelay_success() public {
+        // Arrange
+        address delegatedOwner = _attachPortalDelegation(DELEGATED_OWNER_PK);
+        uint256 accountId = registry.computeAccountId(delegatedOwner, DEFAULT_SALT);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory sig = _signRegister(DELEGATED_OWNER_PK, accountId, PK1X, PK1Y, expiry, 0);
+        assertTrue(registry.allowedRelays(address(this)));
+
+        // Act
+        registry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, delegatedOwner, sig);
+
+        // Assert
+        assertEq(registry.ownerOf(accountId), delegatedOwner);
+        assertEq(registry.nonces(accountId), 1);
+    }
+
+    /// @dev A delegated EOA whose delegate is a real ERC-7739 wallet must
+    ///      still reach the appendix parser. This is what forces the
+    ///      delegated-owner branch to use non-reverting `tryRecover`: a
+    ///      reverting `recover` would reject the longer appendix signature
+    ///      on length before the parser ever saw it, locking out every
+    ///      7739-capable delegate.
+    function test_register_eip7702DelegatedOwner_erc7739AppendixSignature_success() public {
+        // Arrange
+        uint256 walletOwnerKey = 0x7739;
+        address walletOwner = vm.addr(walletOwnerKey);
+        MockERC7739Account walletImpl = new MockERC7739Account(walletOwner);
+        address delegatedOwner = vm.addr(DELEGATED_OWNER_PK);
+        vm.signAndAttachDelegation(address(walletImpl), DELEGATED_OWNER_PK);
+        assertEq(EIP7702Utils.fetchDelegate(delegatedOwner), address(walletImpl));
+
+        uint256 accountId = registry.computeAccountId(delegatedOwner, DEFAULT_SALT);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes32 rawDigest = _registerDigest(accountId, PK1X, PK1Y, expiry, 0);
+        bytes32 walletDigest = _mockERC7739WalletDigest(delegatedOwner, rawDigest);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(walletOwnerKey, walletDigest);
+        bytes memory sig = abi.encodePacked(
+            abi.encodePacked(r, s, v), _domainSeparator(), rawDigest, bytes("Contents(bytes32 stuff)"), uint16(23)
+        );
+
+        // Act
+        registry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, delegatedOwner, sig);
+
+        // Assert
+        assertEq(registry.ownerOf(accountId), delegatedOwner);
+        assertEq(registry.nonces(accountId), 1);
+    }
+
+    /// @dev The delegated EOA's own key stays root authority for auth key
+    ///      mutations even when the installed delegate's ERC-1271 policy
+    ///      rejects the same raw digest. That key can revoke the delegation
+    ///      at any time, so the delegate never holds authority the key lacks.
+    function test_register_eip7702DelegatedOwner_delegateRejectsErc1271_success() public {
+        // Arrange
+        ERC1271RejectingWalletMock rejectingImpl = new ERC1271RejectingWalletMock();
+        address delegatedOwner = vm.addr(DELEGATED_OWNER_PK);
+        vm.signAndAttachDelegation(address(rejectingImpl), DELEGATED_OWNER_PK);
+        assertEq(EIP7702Utils.fetchDelegate(delegatedOwner), address(rejectingImpl));
+
+        uint256 accountId = registry.computeAccountId(delegatedOwner, DEFAULT_SALT);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory sig = _signRegister(DELEGATED_OWNER_PK, accountId, PK1X, PK1Y, expiry, 0);
+
+        // Act
+        vm.prank(delegatedOwner);
+        registry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, delegatedOwner, sig);
+
+        // Assert
+        assertEq(registry.ownerOf(accountId), delegatedOwner);
+        assertEq(registry.nonces(accountId), 1);
+    }
+
     // ============ Revoke Tests ============
 
     function test_revoke_success() public {
@@ -1709,11 +2141,9 @@ contract AuthRegistryTest is Test {
 
         // Register two auth keys
         bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         bytes memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
-        vm.prank(signer);
         registry.register(salt, PK2X, PK2Y, expiry, signer, sig2);
 
         bytes32 authKeyId1 = registry.computeAuthKeyId(accountId, PK1X);
@@ -1725,15 +2155,32 @@ contract AuthRegistryTest is Test {
         bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 2);
 
         vm.expectEmit(true, true, true, true);
-        emit IAuthRegistry.AuthKeyRevoked(accountId, authKeyId1, 0);
-
-        vm.prank(signer);
+        emit IAuthRegistry.AuthKeyRevoked(accountId, authKeyId1, 0, 0);
         registry.revoke(accountId, PK1X, expiry, revokeSig);
 
         assertTrue(registry.authKeyRevoked(authKeyId1));
         assertFalse(registry.authKeyRevoked(authKeyId2)); // Second key still active
         assertEq(registry.getAuthKeys(accountId).length, 2); // Total still 2
         assertEq(registry.nonces(accountId), 3);
+    }
+
+    function test_revoke_owner_direct_success() public {
+        uint256 privateKey = 0x1234;
+        address signer = vm.addr(privateKey);
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(signer, salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
+
+        bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
+        vm.prank(signer);
+        registry.revoke(accountId, PK1X, expiry, revokeSig);
+
+        bytes32 authKeyId = registry.computeAuthKeyId(accountId, PK1X);
+        assertTrue(registry.authKeyRevoked(authKeyId), "owner direct revoke should revoke key");
+        assertEq(registry.nonces(accountId), 2, "owner direct revoke should increment nonce");
     }
 
     function test_revoke_alreadyRevoked_reverts() public {
@@ -1745,17 +2192,14 @@ contract AuthRegistryTest is Test {
 
         // Register auth key
         bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         // Revoke it
         bytes memory revokeSig1 = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
-        vm.prank(signer);
         registry.revoke(accountId, PK1X, expiry, revokeSig1);
 
         // Try to revoke again
         bytes memory revokeSig2 = _signRevoke(privateKey, accountId, PK1X, expiry, 2);
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.AuthKeyAlreadyRevoked.selector);
         registry.revoke(accountId, PK1X, expiry, revokeSig2);
     }
@@ -1769,12 +2213,10 @@ contract AuthRegistryTest is Test {
 
         // Register one auth key
         bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         // Try to revoke non-existent auth key
         bytes memory revokeSig = _signRevoke(privateKey, accountId, 999, expiry, 1);
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.AuthKeyNotFound.selector);
         registry.revoke(accountId, 999, expiry, revokeSig);
     }
@@ -1788,16 +2230,13 @@ contract AuthRegistryTest is Test {
 
         // Register and revoke auth key
         bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
-        vm.prank(signer);
         registry.revoke(accountId, PK1X, expiry, revokeSig);
 
         // Try to rotate revoked auth key
         bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, 666, 777, expiry, 2);
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.AuthKeyAlreadyRevoked.selector);
         registry.rotate(accountId, PK1X, 666, 777, expiry, rotSig);
     }
@@ -1812,7 +2251,6 @@ contract AuthRegistryTest is Test {
 
         // Register auth key
         bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         // Try to revoke as notAuthorized
@@ -1820,6 +2258,17 @@ contract AuthRegistryTest is Test {
         vm.prank(notAuthorized);
         vm.expectRevert(IAuthRegistry.NotAuthorized.selector);
         registry.revoke(accountId, PK1X, expiry, revokeSig);
+    }
+
+    function test_revoke_notAuthorized_beforeNotRegistered_reverts() public {
+        uint256 privateKey = 0x1234;
+        address notAuthorized = address(0xDEAD);
+        uint256 accountId = 111;
+
+        bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, 0, 0);
+        vm.prank(notAuthorized);
+        vm.expectRevert(IAuthRegistry.NotAuthorized.selector);
+        registry.revoke(accountId, PK1X, 0, revokeSig);
     }
 
     function test_revoke_invalidSignature_reverts() public {
@@ -1832,12 +2281,10 @@ contract AuthRegistryTest is Test {
 
         // Register auth key
         bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         // Try to revoke with wrong signature
         bytes memory revokeSig = _signRevoke(wrongPrivateKey, accountId, PK1X, expiry, 1);
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidSignature.selector);
         registry.revoke(accountId, PK1X, expiry, revokeSig);
     }
@@ -1854,15 +2301,12 @@ contract AuthRegistryTest is Test {
         // Register auth key
         uint64 regExpiry = uint64(block.timestamp + 1 hours);
         bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, regExpiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, regExpiry, signer, regSig);
 
         // Try to revoke with expired signature
         uint64 revokeExpiry = uint64(block.timestamp - 1); // 999 < 1000
         uint256 nonce = registry.nonces(accountId); // Should be 1
         bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, revokeExpiry, nonce);
-
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.SignatureExpired.selector);
         registry.revoke(accountId, PK1X, revokeExpiry, revokeSig);
     }
@@ -1876,18 +2320,17 @@ contract AuthRegistryTest is Test {
 
         // Register auth key
         bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         uint256 rootBeforeRevoke = registry.authTreeRoot(0);
 
         // Revoke
         bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
-        vm.prank(signer);
         registry.revoke(accountId, PK1X, expiry, revokeSig);
 
-        // Verify root changed (leaf set to 0)
+        // Verify the only leaf was replaced by the canonical zero leaf.
         assertNotEq(registry.authTreeRoot(0), rootBeforeRevoke, "Root should change after revoke");
+        assertEq(registry.authTreeRoot(0), LibAuthZeroHashes.get()[20]);
     }
 
     function test_revoke_allowedRelay_success() public {
@@ -1906,7 +2349,6 @@ contract AuthRegistryTest is Test {
 
         // Register auth key (using relay)
         bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         bytes32 authKeyId = registry.computeAuthKeyId(accountId, PK1X);
@@ -1914,9 +2356,6 @@ contract AuthRegistryTest is Test {
 
         // Revoke using relay
         bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 1);
-
-        vm.expectEmit(true, true, true, true);
-        emit IAuthRegistry.AuthKeyRevoked(accountId, authKeyId, 0);
 
         vm.prank(relay);
         registry.revoke(accountId, PK1X, expiry, revokeSig);
@@ -1940,7 +2379,6 @@ contract AuthRegistryTest is Test {
 
         // Register auth key
         bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(relay);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         // Disable relay
@@ -1956,12 +2394,10 @@ contract AuthRegistryTest is Test {
 
     function test_revoke_notRegistered_reverts() public {
         uint256 privateKey = 0x1234;
-        address signer = vm.addr(privateKey);
         uint256 accountId = 111;
 
         // Try to revoke without any registration (ownerOf[accountId] == address(0))
         bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, 0, 0);
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.NotRegistered.selector);
         registry.revoke(accountId, PK1X, 0, revokeSig);
     }
@@ -1975,11 +2411,9 @@ contract AuthRegistryTest is Test {
 
         // Register two auth keys
         bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         bytes memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
-        vm.prank(signer);
         registry.register(salt, PK2X, PK2Y, expiry, signer, sig2);
 
         bytes32 authKeyId1 = registry.computeAuthKeyId(accountId, PK1X);
@@ -1989,14 +2423,12 @@ contract AuthRegistryTest is Test {
 
         // Revoke first auth key
         bytes memory revokeSig1 = _signRevoke(privateKey, accountId, PK1X, expiry, 2);
-        vm.prank(signer);
         registry.revoke(accountId, PK1X, expiry, revokeSig1);
         assertTrue(registry.authKeyRevoked(authKeyId1));
         assertFalse(registry.authKeyRevoked(authKeyId2));
 
         // Revoke second auth key
         bytes memory revokeSig2 = _signRevoke(privateKey, accountId, PK2X, expiry, 3);
-        vm.prank(signer);
         registry.revoke(accountId, PK2X, expiry, revokeSig2);
 
         // Verify all auth keys are revoked
@@ -2019,7 +2451,6 @@ contract AuthRegistryTest is Test {
 
         // Register
         bytes memory regSig = _signRegister(privateKey, accountId, authPkX, authPkY, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, authPkX, authPkY, expiry, signer, regSig);
 
         bytes32 authKeyId = registry.computeAuthKeyId(accountId, authPkX);
@@ -2033,9 +2464,9 @@ contract AuthRegistryTest is Test {
         bytes memory rotSig = _signRotate(privateKey, accountId, authPkX, authPkX, newAuthPkY, newExpiry, 1);
 
         vm.expectEmit(true, true, true, true);
-        emit IAuthRegistry.AuthKeyRotated(accountId, authKeyId, authPkX, newAuthPkY, originalIndex, newExpiry);
-
-        vm.prank(signer);
+        emit IAuthRegistry.AuthKeyRotated(
+            accountId, authKeyId, originalTree, authPkX, newAuthPkY, originalIndex, newExpiry
+        );
         registry.rotate(accountId, authPkX, authPkX, newAuthPkY, newExpiry, rotSig);
 
         // Verify authKeyId unchanged (same tree/index)
@@ -2065,7 +2496,6 @@ contract AuthRegistryTest is Test {
         for (uint256 i = 0; i < 5; i++) {
             uint256 nonce = registry.nonces(accountId);
             bytes memory sig = _signRegister(privateKey, accountId, pkXs[i], pkYs[i], expiry, nonce);
-            vm.prank(signer);
             registry.register(salt, pkXs[i], pkYs[i], expiry, signer, sig);
         }
 
@@ -2099,7 +2529,6 @@ contract AuthRegistryTest is Test {
 
         // (1, 2) is not on the BabyJubJub curve
         bytes memory sig = _signRegister(privateKey, accountId, 1, 2, expiry, 0);
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidAuthPublicKey.selector);
         registry.register(salt, 1, 2, expiry, signer, sig);
     }
@@ -2113,7 +2542,6 @@ contract AuthRegistryTest is Test {
 
         // (0, 1) is the Edwards identity and a low-order point (8*P == identity).
         bytes memory sig = _signRegister(privateKey, accountId, 0, 1, expiry, 0);
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidAuthPublicKey.selector);
         registry.register(salt, 0, 1, expiry, signer, sig);
     }
@@ -2130,7 +2558,6 @@ contract AuthRegistryTest is Test {
         uint256 yMinus1 = prime - 1;
 
         bytes memory sig = _signRegister(privateKey, accountId, 0, yMinus1, expiry, 0);
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidAuthPublicKey.selector);
         registry.register(salt, 0, yMinus1, expiry, signer, sig);
     }
@@ -2145,7 +2572,6 @@ contract AuthRegistryTest is Test {
         // x >= BabyJubJub PRIME
         uint256 bigX = 21888242871839275222246405745257275088548364400416034343698204186575808495617; // PRIME
         bytes memory sig = _signRegister(privateKey, accountId, bigX, PK1Y, expiry, 0);
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidAuthPublicKey.selector);
         registry.register(salt, bigX, PK1Y, expiry, signer, sig);
     }
@@ -2159,12 +2585,10 @@ contract AuthRegistryTest is Test {
 
         // Register a valid key first
         bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         // Try to rotate to an off-curve point
         bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, 1, 2, expiry, 1);
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidAuthPublicKey.selector);
         registry.rotate(accountId, PK1X, 1, 2, expiry, rotSig);
     }
@@ -2178,14 +2602,11 @@ contract AuthRegistryTest is Test {
 
         // Register a valid key first
         bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
 
         uint64 newExpiry = uint64(block.timestamp + 2 hours);
         uint256 rotateNonce = registry.nonces(accountId);
         bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, 0, 1, newExpiry, rotateNonce);
-
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.InvalidAuthPublicKey.selector);
         registry.rotate(accountId, PK1X, 0, 1, newExpiry, rotSig);
     }
@@ -2199,42 +2620,46 @@ contract AuthRegistryTest is Test {
 
         // Unregistered authKeyId should return zeros
         bytes32 unregisteredId = registry.computeAuthKeyId(accountId, 999);
-        (uint16 tree1, uint32 index1, bool revoked1) = registry.getAuthKeyInfo(unregisteredId);
+        (uint16 tree1, uint32 index1, bool revoked1, bool exists1, uint256 leaf1) =
+            registry.getAuthKeyInfo(unregisteredId);
         assertEq(tree1, 0);
         assertEq(index1, 0);
         assertFalse(revoked1);
+        assertFalse(exists1);
+        assertEq(leaf1, 0);
 
         // Register auth key
         bytes memory sig1 = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig1);
 
         bytes32 authKeyId = registry.computeAuthKeyId(accountId, PK1X);
-        (uint16 tree2, uint32 index2, bool revoked2) = registry.getAuthKeyInfo(authKeyId);
+        (uint16 tree2, uint32 index2, bool revoked2, bool exists2, uint256 leaf2) = registry.getAuthKeyInfo(authKeyId);
         assertEq(tree2, 0);
         assertEq(index2, 0);
         assertFalse(revoked2);
+        assertTrue(exists2);
+        assertTrue(leaf2 != 0);
 
         // Register second auth key
         bytes memory sig2 = _signRegister(privateKey, accountId, PK2X, PK2Y, expiry, 1);
-        vm.prank(signer);
         registry.register(salt, PK2X, PK2Y, expiry, signer, sig2);
 
         bytes32 authKeyId2 = registry.computeAuthKeyId(accountId, PK2X);
-        (uint16 tree3, uint32 index3, bool revoked3) = registry.getAuthKeyInfo(authKeyId2);
+        (uint16 tree3, uint32 index3, bool revoked3,,) = registry.getAuthKeyInfo(authKeyId2);
         assertEq(tree3, 0);
         assertEq(index3, 1); // Second registration
         assertFalse(revoked3);
 
         // Revoke first auth key
         bytes memory revokeSig = _signRevoke(privateKey, accountId, PK1X, expiry, 2);
-        vm.prank(signer);
         registry.revoke(accountId, PK1X, expiry, revokeSig);
 
-        (uint16 tree4, uint32 index4, bool revoked4) = registry.getAuthKeyInfo(authKeyId);
+        (uint16 tree4, uint32 index4, bool revoked4, bool exists4, uint256 leaf4) = registry.getAuthKeyInfo(authKeyId);
         assertEq(tree4, 0);
         assertEq(index4, 0);
         assertTrue(revoked4); // Now revoked
+        assertTrue(exists4);
+        assertEq(leaf4, 0);
     }
 
     // ============ Unlimited Tree Rollover Tests ============
@@ -2254,12 +2679,10 @@ contract AuthRegistryTest is Test {
         // Set _authTreeState[32767].leafCount = 2^20 (full)
         bytes32 treeStateBase = keccak256(abi.encode(uint256(32767), uint256(1)));
         vm.store(address(registry), treeStateBase, bytes32(uint256(12345)));
-        uint256 packedCursorLeafCount = uint256(1 << 20) << 64;
-        vm.store(address(registry), bytes32(uint256(treeStateBase) + 1), bytes32(packedCursorLeafCount));
+        vm.store(address(registry), bytes32(uint256(treeStateBase) + 1), _packAuthTreeStateTail(0, uint32(1 << 20)));
 
         // Register should revert with RegistryFull since no more trees can be created
         bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         vm.expectRevert(IAuthRegistry.RegistryFull.selector);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
     }
@@ -2278,17 +2701,14 @@ contract AuthRegistryTest is Test {
         assertEq(registry.currentAuthTreeNumber(), 15, "currentAuthTreeNumber should be 15");
 
         // Set _authTreeState[15].leafCount = 2^20 (full).
-        // _authTreeState mapping is at slot 1. AuthTreeState: root (slot+0), cursor|leafCount (slot+1).
+        // _authTreeState mapping is at slot 1. AuthTreeState: root (slot+0), cursor/leafCount (slot+1).
         bytes32 treeStateBase = keccak256(abi.encode(uint256(15), uint256(1)));
         // Set root to non-zero (simulating an initialized tree)
         vm.store(address(registry), treeStateBase, bytes32(uint256(12345)));
-        // Pack leafCount (uint32 at bits 64-95) with cursor=0 (uint64 at bits 0-63)
-        uint256 packedCursorLeafCount = uint256(1 << 20) << 64;
-        vm.store(address(registry), bytes32(uint256(treeStateBase) + 1), bytes32(packedCursorLeafCount));
+        vm.store(address(registry), bytes32(uint256(treeStateBase) + 1), _packAuthTreeStateTail(0, uint32(1 << 20)));
 
         // Register: should trigger rollover to tree 16 (previously reverted with MaxAuthTreesReached)
         bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
-        vm.prank(signer);
         registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
 
         assertEq(registry.currentAuthTreeNumber(), 16, "Should have rolled over to tree 16");
@@ -2299,5 +2719,441 @@ contract AuthRegistryTest is Test {
         uint256[] memory roots = registry.getAllAuthTreeRoots();
         assertEq(roots.length, 17, "Should return 17 trees (0-16)");
         assertGt(roots[16], 0, "Tree 16 root should be non-zero");
+    }
+
+    /// @dev Registers PK1X under a fresh account derived from `privateKey` so each call adds a
+    ///      distinct leaf and advances the active tree root by one update.
+    function _registerFreshAccount(uint256 privateKey) internal {
+        address signer = vm.addr(privateKey);
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(signer, salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        uint256 nonce = registry.nonces(accountId);
+        bytes memory sig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, nonce);
+        registry.register(salt, PK1X, PK1Y, expiry, signer, sig);
+    }
+
+    function _forceRolloverAfterNextRegister() internal {
+        bytes32 treeStateBase = keccak256(abi.encode(uint256(0), uint256(1)));
+        vm.store(address(registry), bytes32(uint256(treeStateBase) + 1), _packAuthTreeStateTail(0, uint32(1 << 20)));
+
+        _registerFreshAccount(0xC3);
+        assertEq(registry.currentAuthTreeNumber(), 1, "should have rolled over to tree 1");
+    }
+
+    function test_auth_root_anchors_initialized() public view {
+        // Arrange
+        uint256 zeroRoot = registry.authTreeRoot(0);
+
+        // Act
+        uint64 supersededBlock = registry.authTreeRootAnchors(0, zeroRoot);
+
+        // Assert
+        assertEq(supersededBlock, 0, "current root should not write an anchor");
+    }
+
+    function test_auth_root_anchors_update_on_register() public {
+        // Arrange
+        uint256 previousRoot = registry.authTreeRoot(0);
+        uint64 updateBlock = uint64(block.number + 7);
+
+        // Act
+        vm.roll(updateBlock);
+        _registerFreshAccount(0xA0);
+        uint256 currentRoot = registry.authTreeRoot(0);
+        uint64 oldSupersededBlock = registry.authTreeRootAnchors(0, previousRoot);
+        uint64 newSupersededBlock = registry.authTreeRootAnchors(0, currentRoot);
+
+        // Assert
+        assertEq(oldSupersededBlock, updateBlock, "previous anchor should be superseded at update block");
+        assertEq(newSupersededBlock, 0, "current root should not write an anchor");
+    }
+
+    function test_auth_root_anchors_seed_new_tree_on_rollover() public {
+        // Arrange
+        uint64 rolloverBlock = uint64(block.number + 3);
+        uint256 zeroRoot = registry.authTreeRoot(0);
+        address signer = vm.addr(0xC3);
+        uint256 accountId = registry.computeAccountId(signer, DEFAULT_SALT);
+        uint256 leaf = registry.computeLeaf(accountId, PK1X, PK1Y, uint64(block.timestamp + 1 hours));
+        uint256 expectedRoot = _manualSingleLeafRoot(leaf);
+
+        // Act
+        vm.roll(rolloverBlock);
+        _forceRolloverAfterNextRegister();
+        uint256 newTreeRoot = registry.authTreeRoot(1);
+        uint64 zeroSupersededBlock = registry.authTreeRootAnchors(1, zeroRoot);
+        uint64 currentSupersededBlock = registry.authTreeRootAnchors(1, newTreeRoot);
+
+        // Assert
+        assertEq(newTreeRoot, expectedRoot, "first leaf after rollover should match manual root");
+        assertEq(zeroSupersededBlock, rolloverBlock, "zero-root anchor should be superseded by first leaf");
+        assertEq(currentSupersededBlock, 0, "new tree first leaf root should not write an anchor");
+    }
+
+    function test_auth_root_anchors_same_leaf_does_not_update_root() public {
+        // Arrange
+        uint256 privateKey = 0xA3;
+        address signer = vm.addr(privateKey);
+        uint256 accountId = registry.computeAccountId(signer, DEFAULT_SALT);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        registry.register(DEFAULT_SALT, PK1X, PK1Y, expiry, signer, regSig);
+        uint256 rootBefore = registry.authTreeRoot(0);
+        uint64 rootSupersededBefore = registry.authTreeRootAnchors(0, rootBefore);
+
+        // Act
+        vm.recordLogs();
+        bytes memory rotSig = _signRotate(privateKey, accountId, PK1X, PK1X, PK1Y, expiry, registry.nonces(accountId));
+        registry.rotate(accountId, PK1X, PK1X, PK1Y, expiry, rotSig);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        // Assert
+        assertEq(registry.authTreeRoot(0), rootBefore, "same leaf should keep root");
+        assertEq(
+            registry.authTreeRootAnchors(0, rootBefore), rootSupersededBefore, "same leaf should not update anchor"
+        );
+        bytes32 rootUpdatedTopic = keccak256("RootUpdated(uint256,uint256)");
+        for (uint256 i = 0; i < logs.length; ++i) {
+            assertFalse(logs[i].topics[0] == rootUpdatedTopic, "same leaf should not emit RootUpdated");
+        }
+    }
+
+    function test_isCurrentAuthTreeRoot_zero_root_returns_false() public view {
+        // Arrange / Act / Assert
+        assertFalse(registry.isCurrentAuthTreeRoot(0, 0));
+    }
+
+    function test_isCurrentAuthTreeRoot_current_root() public {
+        // Arrange / Act / Assert
+        assertTrue(registry.isCurrentAuthTreeRoot(0, registry.authTreeRoot(0)));
+
+        // Act
+        _registerFreshAccount(0x1234);
+
+        // Assert
+        assertTrue(registry.isCurrentAuthTreeRoot(0, registry.authTreeRoot(0)));
+    }
+
+    function test_isRecentAuthTreeRoot_zero_staleness_matches_current_only() public {
+        // Arrange
+        _registerFreshAccount(0xA1);
+        uint256 oldRoot = registry.authTreeRoot(0);
+        _registerFreshAccount(0xA2);
+        uint256 currentRoot = registry.authTreeRoot(0);
+
+        // Act / Assert
+        assertFalse(registry.isRecentAuthTreeRoot(0, oldRoot, 0), "old root should fail current-only validation");
+        assertTrue(registry.isRecentAuthTreeRoot(0, currentRoot, 0), "current root should pass current-only validation");
+    }
+
+    function test_isRecentAuthTreeRoot_staleness_boundaries() public {
+        // Arrange
+        _registerFreshAccount(0xA4);
+        uint256 oldRoot = registry.authTreeRoot(0);
+        vm.roll(block.number + 10);
+        _registerFreshAccount(0xA5);
+
+        // Act / Assert
+        assertTrue(registry.isRecentAuthTreeRoot(0, oldRoot, 4), "same block superseded root is valid in window");
+        vm.roll(block.number + 4);
+        assertTrue(registry.isRecentAuthTreeRoot(0, oldRoot, 4), "root should be valid at exact staleness bound");
+        vm.roll(block.number + 1);
+        assertFalse(registry.isRecentAuthTreeRoot(0, oldRoot, 4), "root should expire after staleness bound");
+    }
+
+    function test_areRecentAuthTreeRoots_empty_returns_true() public view {
+        // Arrange
+        TreeRootPair[] memory roots = new TreeRootPair[](0);
+
+        // Act / Assert
+        assertTrue(registry.areRecentAuthTreeRoots(roots, 0), "empty batch should pass aggregate check");
+    }
+
+    function test_areRecentAuthTreeRoots_all_recent_returns_true() public {
+        // Arrange
+        _registerFreshAccount(0xA40);
+        uint256 oldRoot = registry.authTreeRoot(0);
+        _registerFreshAccount(0xA41);
+        uint256 currentRoot = registry.authTreeRoot(0);
+        TreeRootPair[] memory roots = new TreeRootPair[](2);
+        roots[0] = TreeRootPair({treeNumber: 0, root: oldRoot});
+        roots[1] = TreeRootPair({treeNumber: 0, root: currentRoot});
+
+        // Act / Assert
+        assertTrue(registry.areRecentAuthTreeRoots(roots, type(uint64).max), "all recent roots should pass");
+    }
+
+    function test_areRecentAuthTreeRoots_unknown_or_zero_returns_false() public view {
+        // Arrange
+        TreeRootPair[] memory unknownRoots = new TreeRootPair[](1);
+        unknownRoots[0] = TreeRootPair({treeNumber: 0, root: uint256(keccak256("unknown-auth-root"))});
+        TreeRootPair[] memory zeroRoots = new TreeRootPair[](1);
+        zeroRoots[0] = TreeRootPair({treeNumber: 0, root: 0});
+
+        // Act / Assert
+        assertFalse(registry.areRecentAuthTreeRoots(unknownRoots, type(uint64).max), "unknown root should fail");
+        assertFalse(registry.areRecentAuthTreeRoots(zeroRoots, type(uint64).max), "zero root should fail");
+    }
+
+    function test_areRecentAuthTreeRoots_expired_root_returns_false() public {
+        // Arrange
+        _registerFreshAccount(0xA42);
+        uint256 oldRoot = registry.authTreeRoot(0);
+        vm.roll(block.number + 10);
+        _registerFreshAccount(0xA43);
+        TreeRootPair[] memory roots = new TreeRootPair[](1);
+        roots[0] = TreeRootPair({treeNumber: 0, root: oldRoot});
+
+        // Act / Assert
+        assertTrue(registry.areRecentAuthTreeRoots(roots, 4), "root should be valid in window");
+        vm.roll(block.number + 5);
+        assertFalse(registry.areRecentAuthTreeRoots(roots, 4), "expired root should fail aggregate check");
+    }
+
+    function test_isRecentAuthTreeRoot_tracks_superseded_root_by_anchor() public {
+        // Arrange
+        _registerFreshAccount(0xB0);
+        uint256 supersededRoot = registry.authTreeRoot(0);
+        assertTrue(registry.isRecentAuthTreeRoot(0, supersededRoot, type(uint64).max), "root should start as recent");
+
+        // Act
+        for (uint256 i = 0; i < 64; ++i) {
+            _registerFreshAccount(0x1000 + i);
+        }
+
+        // Assert
+        assertTrue(
+            registry.isRecentAuthTreeRoot(0, supersededRoot, type(uint64).max),
+            "root-keyed anchor should remain recent independent of update count"
+        );
+        assertTrue(registry.isRecentAuthTreeRoot(0, registry.authTreeRoot(0), 0), "current root should remain accepted");
+    }
+
+    function test_hydrateAuthRootAnchorsFromRoots_seeds_snapshot_root_not_in_history() public {
+        // Arrange
+        _markAsLegacyInitialized();
+        uint256 snapshotRoot = uint256(keccak256("snapshot-root-not-in-history"));
+        TreeRootPair[] memory snapshotRoots = new TreeRootPair[](1);
+        snapshotRoots[0] = TreeRootPair({treeNumber: 0, root: snapshotRoot});
+        uint64 migrationBlock = uint64(block.number + 9);
+
+        assertFalse(
+            registry.isRecentAuthTreeRoot(0, snapshotRoot, type(uint64).max),
+            "snapshot root should not be recent before migration"
+        );
+
+        // Act
+        vm.roll(migrationBlock);
+        registry.hydrateAuthRootAnchorsFromRoots(snapshotRoots);
+        uint64 snapshotSuperseded = registry.authTreeRootAnchors(0, snapshotRoot);
+
+        // Assert
+        assertEq(snapshotSuperseded, migrationBlock, "snapshot superseded should be migration block");
+        assertTrue(registry.isRecentAuthTreeRoot(0, snapshotRoot, 300), "hydrated snapshot root should be recent");
+    }
+
+    function test_hydrateAuthRootAnchorsFromRoots_seeds_current_roots_without_snapshot_input() public {
+        // Arrange
+        _markAsLegacyInitialized();
+        _registerFreshAccount(0xA8);
+        uint256 currentRoot = registry.authTreeRoot(0);
+        TreeRootPair[] memory snapshotRoots = new TreeRootPair[](0);
+        uint64 migrationBlock = uint64(block.number + 4);
+
+        // Act
+        vm.roll(migrationBlock);
+        registry.hydrateAuthRootAnchorsFromRoots(snapshotRoots);
+        uint64 currentSuperseded = registry.authTreeRootAnchors(0, currentRoot);
+
+        // Assert
+        assertEq(currentSuperseded, 0, "current root should not write an anchor");
+        assertTrue(registry.isRecentAuthTreeRoot(0, currentRoot, 0), "current root should be recent with zero window");
+    }
+
+    function test_hydrateAuthRootAnchorsFromRoots_current_snapshot_root_has_zero_superseded() public {
+        // Arrange
+        _markAsLegacyInitialized();
+        _registerFreshAccount(0xA9);
+        uint256 currentRoot = registry.authTreeRoot(0);
+        TreeRootPair[] memory snapshotRoots = new TreeRootPair[](1);
+        snapshotRoots[0] = TreeRootPair({treeNumber: 0, root: currentRoot});
+        uint64 migrationBlock = uint64(block.number + 5);
+
+        // Act
+        vm.roll(migrationBlock);
+        registry.hydrateAuthRootAnchorsFromRoots(snapshotRoots);
+        uint64 currentSuperseded = registry.authTreeRootAnchors(0, currentRoot);
+
+        // Assert
+        assertEq(currentSuperseded, 0, "current snapshot root should not write an anchor");
+    }
+
+    function test_hydrateAuthRootAnchorsFromRoots_stale_root_expires_after_window() public {
+        // Arrange
+        _markAsLegacyInitialized();
+        uint256 snapshotRoot = uint256(keccak256("snapshot-root-expires"));
+        TreeRootPair[] memory snapshotRoots = new TreeRootPair[](1);
+        snapshotRoots[0] = TreeRootPair({treeNumber: 0, root: snapshotRoot});
+        uint64 migrationBlock = uint64(block.number + 6);
+
+        // Act
+        vm.roll(migrationBlock);
+        registry.hydrateAuthRootAnchorsFromRoots(snapshotRoots);
+
+        // Assert
+        assertTrue(registry.isRecentAuthTreeRoot(0, snapshotRoot, 3), "snapshot root should be valid in window");
+        vm.roll(migrationBlock + 4);
+        assertFalse(registry.isRecentAuthTreeRoot(0, snapshotRoot, 3), "snapshot root should expire after window");
+    }
+
+    function test_hydrateAuthRootAnchorsFromRoots_reverts_invalid_tree() public {
+        // Arrange
+        _markAsLegacyInitialized();
+        TreeRootPair[] memory snapshotRoots = new TreeRootPair[](1);
+        snapshotRoots[0] = TreeRootPair({treeNumber: registry.currentAuthTreeNumber() + 1, root: 123});
+
+        // Act / Assert
+        vm.expectRevert(IAuthRegistry.InvalidAuthTreeNumber.selector);
+        registry.hydrateAuthRootAnchorsFromRoots(snapshotRoots);
+    }
+
+    function test_hydrateAuthRootAnchorsFromRoots_reverts_zero_root() public {
+        // Arrange
+        _markAsLegacyInitialized();
+        TreeRootPair[] memory snapshotRoots = new TreeRootPair[](1);
+        snapshotRoots[0] = TreeRootPair({treeNumber: 0, root: 0});
+
+        // Act / Assert
+        vm.expectRevert(IAuthRegistry.InvalidSnapshotRoot.selector);
+        registry.hydrateAuthRootAnchorsFromRoots(snapshotRoots);
+    }
+
+    function test_hydrateAuthRootAnchorsFromRoots_reverts_non_owner() public {
+        // Arrange
+        _markAsLegacyInitialized();
+        uint256 snapshotRoot = uint256(keccak256("non-owner-snapshot-root"));
+        TreeRootPair[] memory snapshotRoots = new TreeRootPair[](1);
+        snapshotRoots[0] = TreeRootPair({treeNumber: 0, root: snapshotRoot});
+
+        // Act / Assert
+        vm.prank(makeAddr("not-owner"));
+        vm.expectRevert(IAuthRegistry.NotAuthorized.selector);
+        registry.hydrateAuthRootAnchorsFromRoots(snapshotRoots);
+
+        registry.hydrateAuthRootAnchorsFromRoots(snapshotRoots);
+        uint64 hydratedSuperseded = registry.authTreeRootAnchors(0, snapshotRoot);
+        assertEq(hydratedSuperseded, uint64(block.number), "reverted non-owner call should not consume initializer");
+    }
+
+    function test_hydrateAuthRootAnchorsFromRoots_allows_owner_once() public {
+        // Arrange
+        _markAsLegacyInitialized();
+        uint256 snapshotRoot = uint256(keccak256("owner-snapshot-root"));
+        TreeRootPair[] memory snapshotRoots = new TreeRootPair[](1);
+        snapshotRoots[0] = TreeRootPair({treeNumber: 0, root: snapshotRoot});
+
+        // Act
+        registry.hydrateAuthRootAnchorsFromRoots(snapshotRoots);
+
+        // Assert
+        uint64 hydratedSuperseded = registry.authTreeRootAnchors(0, snapshotRoot);
+        assertEq(hydratedSuperseded, uint64(block.number), "owner should hydrate anchors");
+
+        vm.expectRevert();
+        registry.hydrateAuthRootAnchorsFromRoots(snapshotRoots);
+    }
+
+    function test_hydrateAuthRootAnchorsFromRoots_setAllowedRelaysDoesNotCloseLegacyWindow() public {
+        // Arrange
+        _markAsLegacyInitialized();
+        uint256 snapshotRoot = uint256(keccak256("relay-update-before-hydrate"));
+        TreeRootPair[] memory snapshotRoots = new TreeRootPair[](1);
+        snapshotRoots[0] = TreeRootPair({treeNumber: 0, root: snapshotRoot});
+        address[] memory relays = new address[](1);
+        relays[0] = makeAddr("new-relay");
+
+        // Act
+        vm.prank(operator);
+        registry.setAllowedRelays(relays, true);
+        registry.hydrateAuthRootAnchorsFromRoots(snapshotRoots);
+
+        // Assert
+        assertEq(registry.authTreeRootAnchors(0, snapshotRoot), uint64(block.number));
+    }
+
+    function test_hydrateAuthRootAnchorsFromRoots_reverts_after_fresh_initialize() public {
+        // Arrange
+        uint256 snapshotRoot = uint256(keccak256("fresh-deploy-snapshot-root"));
+        TreeRootPair[] memory snapshotRoots = new TreeRootPair[](1);
+        snapshotRoots[0] = TreeRootPair({treeNumber: 0, root: snapshotRoot});
+
+        // Act / Assert
+        vm.expectRevert(IAuthRegistry.AuthRootAnchorsAlreadyInitialized.selector);
+        registry.hydrateAuthRootAnchorsFromRoots(snapshotRoots);
+    }
+
+    function test_initialize_reverts_after_legacy_v1_initialization() public {
+        // Arrange
+        _markAsLegacyInitialized();
+        address attacker = makeAddr("attacker");
+
+        // Act / Assert
+        vm.prank(attacker);
+        vm.expectRevert();
+        registry.initialize(attacker);
+        assertEq(registry.owner(), owner, "owner should not change");
+    }
+
+    function test_isRecentAuthTreeRoot_finalizedTreeRecentRoot() public {
+        uint256 privateKey = 0xC1;
+        address signer = vm.addr(privateKey);
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(signer, salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
+
+        uint256 rootBeforeOldTreeUpdate = registry.authTreeRoot(0);
+        _forceRolloverAfterNextRegister();
+
+        uint64 newExpiry = uint64(block.timestamp + 2 hours);
+        bytes memory rotSig =
+            _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, newExpiry, registry.nonces(accountId));
+        registry.rotate(accountId, PK1X, PK2X, PK2Y, newExpiry, rotSig);
+
+        assertTrue(
+            registry.isRecentAuthTreeRoot(0, rootBeforeOldTreeUpdate, type(uint64).max),
+            "recent pre-rotate root of finalized tree should remain recent"
+        );
+        assertTrue(
+            registry.isRecentAuthTreeRoot(0, registry.authTreeRoot(0), 0), "current finalized tree root is recent"
+        );
+    }
+
+    function test_isRecentAuthTreeRoot_finalizedTreeRootExpiresByBlockWindow() public {
+        uint256 privateKey = 0xC2;
+        address signer = vm.addr(privateKey);
+        uint256 salt = DEFAULT_SALT;
+        uint256 accountId = registry.computeAccountId(signer, salt);
+        uint64 expiry = uint64(block.timestamp + 1 hours);
+        bytes memory regSig = _signRegister(privateKey, accountId, PK1X, PK1Y, expiry, 0);
+        registry.register(salt, PK1X, PK1Y, expiry, signer, regSig);
+
+        uint256 staleRoot = registry.authTreeRoot(0);
+        _forceRolloverAfterNextRegister();
+        uint64 newExpiry = uint64(block.timestamp + 2 hours);
+        bytes memory rotSig =
+            _signRotate(privateKey, accountId, PK1X, PK2X, PK2Y, newExpiry, registry.nonces(accountId));
+        registry.rotate(accountId, PK1X, PK2X, PK2Y, newExpiry, rotSig);
+
+        vm.roll(block.number + 10);
+
+        assertFalse(
+            registry.isRecentAuthTreeRoot(0, staleRoot, 9), "old finalized tree root should expire by block window"
+        );
+        assertTrue(
+            registry.isRecentAuthTreeRoot(0, registry.authTreeRoot(0), 0), "current finalized tree root is recent"
+        );
     }
 }

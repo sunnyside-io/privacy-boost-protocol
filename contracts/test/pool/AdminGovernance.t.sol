@@ -17,13 +17,13 @@
 pragma solidity 0.8.34;
 
 import {Test} from "forge-std/Test.sol";
-import {TransparentUpgradeableProxy} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 
 import {PrivacyBoost} from "src/PrivacyBoost.sol";
 import {IPrivacyBoost} from "src/interfaces/IPrivacyBoost.sol";
 import {TokenRegistry} from "src/TokenRegistry.sol";
 import {AuthRegistry} from "src/AuthRegistry.sol";
+import {MAX_NOTE_TREE_DEPTH} from "src/interfaces/Constants.sol";
 
 import {MockVerifier} from "test/helpers/Mocks.sol";
 import {PoolDeployer, DeployConfig} from "test/helpers/PoolDeployer.sol";
@@ -140,60 +140,119 @@ contract AdminGovernanceTest is Test {
             256,
             256,
             0, // maxForcedInputs = 0
+            300,
+            300,
             20
         );
+    }
+
+    function test_constructor_allowsForcedDelayIndependentOfRootStaleness() public {
+        PrivacyBoost configured = new PrivacyBoost(
+            address(tokenRegistry),
+            address(authRegistry),
+            8,
+            1,
+            1,
+            4,
+            256,
+            64, // forcedWithdrawalDelay
+            4,
+            300,
+            64, // retained for gift-exit root validation, not forced-withdraw execution
+            20
+        );
+        assertEq(configured.forcedWithdrawalDelay(), 64);
+        assertEq(configured.maxForcedWithdrawalAuthStalenessBlocks(), 64);
     }
 
     // ========== Constructor Config Validation ==========
 
     function test_constructor_revertWhen_tokenRegistryZeroAddress() public {
         vm.expectRevert(IPrivacyBoost.InvalidTokenRegistryAddress.selector);
-        new PrivacyBoost(address(0), address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 20);
+        new PrivacyBoost(address(0), address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 300, 64, 20);
     }
 
     function test_constructor_revertWhen_tokenRegistryNotContract() public {
         address eoa = makeAddr("eoa");
         vm.expectRevert(IPrivacyBoost.InvalidTokenRegistryAddress.selector);
-        new PrivacyBoost(eoa, address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 20);
+        new PrivacyBoost(eoa, address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 300, 64, 20);
     }
 
     function test_constructor_revertWhen_authRegistryZeroAddress() public {
         vm.expectRevert(IPrivacyBoost.InvalidAuthRegistryAddress.selector);
-        new PrivacyBoost(address(tokenRegistry), address(0), 8, 1, 1, 4, 256, 256, 4, 20);
+        new PrivacyBoost(address(tokenRegistry), address(0), 8, 1, 1, 4, 256, 256, 4, 300, 64, 20);
     }
 
     function test_constructor_revertWhen_authRegistryNotContract() public {
         address eoa = makeAddr("eoaAuth");
         vm.expectRevert(IPrivacyBoost.InvalidAuthRegistryAddress.selector);
-        new PrivacyBoost(address(tokenRegistry), eoa, 8, 1, 1, 4, 256, 256, 4, 20);
+        new PrivacyBoost(address(tokenRegistry), eoa, 8, 1, 1, 4, 256, 256, 4, 300, 64, 20);
     }
 
     function test_constructor_revertWhen_maxBatchSizeZero() public {
         vm.expectRevert(IPrivacyBoost.MaxBatchSizeCannotBeZero.selector);
-        new PrivacyBoost(address(tokenRegistry), address(authRegistry), 0, 1, 1, 4, 256, 256, 4, 20);
+        new PrivacyBoost(address(tokenRegistry), address(authRegistry), 0, 1, 1, 4, 256, 256, 4, 300, 64, 20);
+    }
+
+    function test_constructor_revertWhen_maxBatchSizeExceedsDepositCountWidth() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IPrivacyBoost.MaxBatchSizeOutOfRange.selector, uint32(type(uint16).max) + 1, uint32(type(uint16).max)
+            )
+        );
+        new PrivacyBoost(
+            address(tokenRegistry),
+            address(authRegistry),
+            uint32(type(uint16).max) + 1,
+            1,
+            1,
+            4,
+            256,
+            256,
+            4,
+            300,
+            64,
+            20
+        );
     }
 
     function test_constructor_revertWhen_maxInputsPerTransferZero() public {
         vm.expectRevert(IPrivacyBoost.MaxInputsPerTransferCannotBeZero.selector);
-        new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 0, 1, 4, 256, 256, 4, 20);
+        new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 0, 1, 4, 256, 256, 4, 300, 64, 20);
     }
 
     function test_constructor_revertWhen_maxOutputsPerTransferZero() public {
         vm.expectRevert(IPrivacyBoost.MaxOutputsPerTransferCannotBeZero.selector);
-        new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 1, 0, 4, 256, 256, 4, 20);
+        new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 1, 0, 4, 256, 256, 4, 300, 64, 20);
     }
 
     function test_constructor_revertWhen_maxFeeTokensZero() public {
         vm.expectRevert(IPrivacyBoost.MaxFeeTokensCannotBeZero.selector);
-        new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 1, 1, 0, 256, 256, 4, 20);
+        new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 1, 1, 0, 256, 256, 4, 300, 64, 20);
     }
 
     function test_constructor_revertWhen_merkleDepthOutOfRange() public {
-        vm.expectRevert(abi.encodeWithSelector(IPrivacyBoost.MerkleDepthOutOfRange.selector, 0, 1, 24));
-        new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 0);
+        vm.expectRevert(abi.encodeWithSelector(IPrivacyBoost.MerkleDepthOutOfRange.selector, 0, 1, MAX_NOTE_TREE_DEPTH));
+        new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 300, 64, 0);
 
-        vm.expectRevert(abi.encodeWithSelector(IPrivacyBoost.MerkleDepthOutOfRange.selector, 25, 1, 24));
-        new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 25);
+        uint8 aboveMaximum = MAX_NOTE_TREE_DEPTH + 1;
+        vm.expectRevert(
+            abi.encodeWithSelector(IPrivacyBoost.MerkleDepthOutOfRange.selector, aboveMaximum, 1, MAX_NOTE_TREE_DEPTH)
+        );
+        new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 300, 64, aboveMaximum);
+    }
+
+    function test_constructor_acceptsMaximumMerkleDepth() public {
+        // Arrange
+        uint8 maximumMerkleDepth = MAX_NOTE_TREE_DEPTH;
+
+        // Act
+        PrivacyBoost configured = new PrivacyBoost(
+            address(tokenRegistry), address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 300, 64, maximumMerkleDepth
+        );
+
+        // Assert
+        assertEq(configured.merkleDepth(), maximumMerkleDepth);
     }
 
     // ========== Treasury Validation ==========
@@ -254,144 +313,6 @@ contract AdminGovernanceTest is Test {
     function test_revertWhen_setOperatorZeroAddress() public {
         vm.expectRevert(IPrivacyBoost.InvalidOperatorAddress.selector);
         pool.setOperator(address(0));
-    }
-
-    // ========== AuthSnapshotInterval Validation ==========
-
-    function test_setAuthSnapshotInterval_updatesState() public {
-        uint256 oldInterval = pool.authSnapshotInterval();
-        uint256 oldVersion = pool.authSnapshotScheduleVersion();
-        uint256 currentRound = pool.currentAuthSnapshotRound();
-
-        uint256 newInterval = 500;
-        vm.prank(operator);
-        pool.setAuthSnapshotInterval(newInterval);
-
-        // Scheduled (not yet active)
-        assertEq(pool.authSnapshotInterval(), oldInterval);
-        assertEq(pool.pendingAuthSnapshotInterval(), newInterval);
-        assertTrue(pool.pendingAuthSnapshotEffectiveBlock() > block.number);
-        assertEq(pool.pendingAuthSnapshotStartRound(), currentRound + 1);
-        assertEq(pool.authSnapshotScheduleVersion(), oldVersion);
-
-        // Activate at the scheduled boundary
-        uint256 effectiveBlock = pool.pendingAuthSnapshotEffectiveBlock();
-        uint256 effectiveRound = pool.pendingAuthSnapshotStartRound();
-        vm.roll(effectiveBlock);
-        pool.syncAuthSnapshotInterval();
-
-        assertEq(pool.authSnapshotInterval(), newInterval);
-        assertEq(pool.authSnapshotStartBlock(), effectiveBlock);
-        assertEq(pool.authSnapshotStartRound(), effectiveRound);
-        assertEq(pool.authSnapshotScheduleVersion(), oldVersion + 1);
-        assertEq(pool.pendingAuthSnapshotEffectiveBlock(), 0);
-    }
-
-    function test_setAuthSnapshotInterval_emitsEvent() public {
-        uint256 oldInterval = pool.authSnapshotInterval();
-        uint256 newVersion = pool.authSnapshotScheduleVersion() + 1;
-        uint256 newInterval = 500;
-
-        vm.expectEmit(false, false, false, true);
-        uint256 currentRound = pool.currentAuthSnapshotRound();
-        uint256 roundStartBlock =
-            pool.authSnapshotStartBlock() + (currentRound - pool.authSnapshotStartRound()) * oldInterval;
-        uint256 effectiveBlock = roundStartBlock + oldInterval;
-        uint256 effectiveRound = currentRound + 1;
-        emit IPrivacyBoost.AuthSnapshotIntervalUpdateScheduled(
-            oldInterval, newInterval, effectiveBlock, effectiveRound, newVersion
-        );
-
-        vm.prank(operator);
-        pool.setAuthSnapshotInterval(newInterval);
-
-        // Activation emits the legacy "updated" event plus the richer activated event.
-        vm.roll(effectiveBlock);
-        vm.expectEmit(false, false, false, true);
-        emit IPrivacyBoost.AuthSnapshotIntervalUpdated(oldInterval, newInterval);
-        vm.expectEmit(false, false, false, true);
-        emit IPrivacyBoost.AuthSnapshotIntervalActivated(
-            oldInterval, newInterval, effectiveBlock, effectiveRound, newVersion
-        );
-        pool.syncAuthSnapshotInterval();
-    }
-
-    function test_setAuthSnapshotInterval_revertWhen_belowMinimum() public {
-        vm.prank(operator);
-        vm.expectRevert(abi.encodeWithSelector(IPrivacyBoost.AuthSnapshotIntervalOutOfRange.selector, 9, 10, 100_000));
-        pool.setAuthSnapshotInterval(9);
-
-        vm.prank(operator);
-        vm.expectRevert(abi.encodeWithSelector(IPrivacyBoost.AuthSnapshotIntervalOutOfRange.selector, 0, 10, 100_000));
-        pool.setAuthSnapshotInterval(0);
-    }
-
-    function test_setAuthSnapshotInterval_revertWhen_aboveMaximum() public {
-        vm.prank(operator);
-        vm.expectRevert(
-            abi.encodeWithSelector(IPrivacyBoost.AuthSnapshotIntervalOutOfRange.selector, 100_001, 10, 100_000)
-        );
-        pool.setAuthSnapshotInterval(100_001);
-    }
-
-    function test_setAuthSnapshotInterval_acceptsBoundaryValues() public {
-        uint256 oldInterval = pool.authSnapshotInterval();
-
-        vm.prank(operator);
-        pool.setAuthSnapshotInterval(10);
-        vm.roll(pool.pendingAuthSnapshotEffectiveBlock());
-        pool.syncAuthSnapshotInterval();
-        assertEq(pool.authSnapshotInterval(), 10);
-
-        vm.prank(operator);
-        pool.setAuthSnapshotInterval(100_000);
-        vm.roll(pool.pendingAuthSnapshotEffectiveBlock());
-        pool.syncAuthSnapshotInterval();
-        assertEq(pool.authSnapshotInterval(), 100_000);
-
-        // Restore original interval for future tests if they share state (defensive).
-        vm.prank(operator);
-        pool.setAuthSnapshotInterval(oldInterval);
-        vm.roll(pool.pendingAuthSnapshotEffectiveBlock());
-        pool.syncAuthSnapshotInterval();
-    }
-
-    function test_revertWhen_nonOperatorSetsAuthSnapshotInterval() public {
-        vm.prank(newOwner);
-        vm.expectRevert(IPrivacyBoost.NotOperator.selector);
-        pool.setAuthSnapshotInterval(500);
-    }
-
-    function test_initialize_revertWhen_authSnapshotIntervalBelowMinimum() public {
-        PrivacyBoost poolImpl =
-            new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 20);
-
-        vm.expectRevert(abi.encodeWithSelector(IPrivacyBoost.AuthSnapshotIntervalOutOfRange.selector, 9, 10, 100_000));
-        new TransparentUpgradeableProxy(
-            address(poolImpl),
-            proxyAdmin,
-            abi.encodeCall(
-                PrivacyBoost.initialize,
-                (owner, address(verifier), address(verifier), address(verifier), 200, treasury, 9)
-            )
-        );
-    }
-
-    function test_initialize_revertWhen_authSnapshotIntervalAboveMaximum() public {
-        PrivacyBoost poolImpl =
-            new PrivacyBoost(address(tokenRegistry), address(authRegistry), 8, 1, 1, 4, 256, 256, 4, 20);
-
-        vm.expectRevert(
-            abi.encodeWithSelector(IPrivacyBoost.AuthSnapshotIntervalOutOfRange.selector, 100_001, 10, 100_000)
-        );
-        new TransparentUpgradeableProxy(
-            address(poolImpl),
-            proxyAdmin,
-            abi.encodeCall(
-                PrivacyBoost.initialize,
-                (owner, address(verifier), address(verifier), address(verifier), 200, treasury, 100_001)
-            )
-        );
     }
 
     // ========== Fee Cap (10% Max) ==========

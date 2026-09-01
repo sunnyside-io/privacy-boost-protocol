@@ -32,9 +32,10 @@ struct DeployConfig {
     uint256 cancelDelay;
     uint256 forcedWithdrawalDelay;
     uint32 maxForcedInputs;
+    uint64 maxEpochAuthStalenessBlocks;
+    uint64 maxForcedWithdrawalAuthStalenessBlocks;
     uint16 withdrawFeeBps;
     address treasury;
-    uint256 authSnapshotInterval;
     uint8 merkleDepth;
     uint8 authTreeDepth;
 }
@@ -56,9 +57,10 @@ library PoolDeployer {
             cancelDelay: 256,
             forcedWithdrawalDelay: 256,
             maxForcedInputs: 4,
+            maxEpochAuthStalenessBlocks: 300,
+            maxForcedWithdrawalAuthStalenessBlocks: 64,
             withdrawFeeBps: 0,
             treasury: address(0),
-            authSnapshotInterval: 300,
             merkleDepth: 20,
             authTreeDepth: 20
         });
@@ -97,6 +99,8 @@ library PoolDeployer {
             cfg.cancelDelay,
             cfg.forcedWithdrawalDelay,
             cfg.maxForcedInputs,
+            cfg.maxEpochAuthStalenessBlocks,
+            cfg.maxForcedWithdrawalAuthStalenessBlocks,
             cfg.merkleDepth
         );
         TransparentUpgradeableProxy proxy = new TransparentUpgradeableProxy(
@@ -109,9 +113,10 @@ library PoolDeployer {
                     cfg.verifier,
                     cfg.verifier,
                     cfg.verifier,
+                    cfg.verifier,
+                    cfg.verifier,
                     cfg.withdrawFeeBps,
-                    cfg.treasury,
-                    cfg.authSnapshotInterval
+                    cfg.treasury
                 )
             )
         );

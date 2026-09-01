@@ -517,7 +517,7 @@ contract SubmitDepositEpochTest is Test {
         uint256 reqId = pool.requestDeposit(tokenId, 3000 ether, commitments, cts);
 
         // Verify stored hash
-        (,,,,, uint16 commitmentCount, uint256 storedHash) = pool.pendingDeposits(reqId);
+        (,,,,, uint16 commitmentCount, uint256 storedHash,) = pool.pendingDeposits(reqId);
         assertEq(commitmentCount, 3);
 
         // Compute expected hash
@@ -652,7 +652,7 @@ contract SubmitDepositEpochTest is Test {
 
         // Set up tree at max capacity using vm.store
         // Storage layout: treeRoot=slot7, treeCount=slot8, treeRootHistory=slot9, treeRootHistoryCursor=slot10
-        // (slots shifted by 1 after operator was added)
+        // (slots shifted by 1 after operator was added; giftClaimVerifier is appended at the end so it does not shift these)
         uint8 MERKLE_DEPTH = 20;
         uint32 MAX_LEAVES = uint32(1 << MERKLE_DEPTH);
 

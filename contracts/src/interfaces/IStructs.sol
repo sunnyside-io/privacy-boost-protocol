@@ -66,9 +66,15 @@ struct Withdrawal {
     uint96 amount;
 }
 
+enum DepositOrigin {
+    UserShield,
+    GatewayRedeposit
+}
+
 /// @notice Pending deposit request for 2-step deposit
 /// @dev Supports multiple commitments per request with hidden individual amounts.
 ///      Only totalAmount is public; individual amounts are in encrypted ciphertext.
+///      Append-only: `rescueCommitment` is the Gateway trailing field. Pre-Gateway deposits read 0.
 struct PendingDeposit {
     address depositor;
     uint16 tokenId;
@@ -77,6 +83,33 @@ struct PendingDeposit {
     uint32 nonce;
     uint16 commitmentCount; // Number of commitments in this request (supports up to 65535)
     uint256 commitmentsHash; // Sequential Poseidon hash: Hash(Hash(...Hash(0, c0), c1), ..., cN)
+    bytes32 rescueCommitment; // Gateway: 0 for normal deposits; nonzero classifies gateway-origin
+}
+
+/// @notice Pending portal-deposit record for the hidden-recipient portal sweep flow
+/// @dev Mirrors PendingDeposit but binds to the registered portal owner instead of a
+///      caller-supplied commitments hash. A portal sweeper never knows the recipient
+///      recipientMPK, so it cannot precompute a note commitment at sweep time; the record
+///      therefore stores the owner binding H (read from E's account-side portal binding, never
+///      caller-supplied) and a per-portal counter, and the epoch builds the note commitment from these.
+///      Like the deposit path, "processed" is tracked in a separate mapping
+///      (processedPortalDeposits), not as a struct field, so the record stays one word
+///      smaller and the processed flag is a single cheap SSTORE.
+///      The sweep fee, when enabled, belongs to `sweeper`, the requestPortalDeposit caller
+///      who did the keeper work and paid its gas, not the epoch submitter. The payee must be
+///      recorded at sweep time so an immediate payment or a deferred same-recipient claim
+///      cannot be redirected by the relay.
+struct PortalPendingDeposit {
+    // Field order packs the record into 4 slots: {portal, requestBlock, tokenId, sweepFeeBps} |
+    // {sweeper, amount} | counter | recipientBindH — one fewer SSTORE per sweep than the naive order.
+    address portal; // E — the portal address that was swept
+    uint64 requestBlock; // for the cancel delay
+    uint16 tokenId;
+    uint16 sweepFeeBps; // fee rate snapshotted at sweep time (0 in the operator-run MVP)
+    address sweeper; // the requestPortalDeposit caller and fixed fee recipient
+    uint96 amount; // gross received delta of the pool, capped at uint96 max; credited note = amount − fee
+    uint256 counter; // portalCounter[E] at sweep time; feeds noteRnd so repeated sweeps stay unique
+    uint256 recipientBindH; // H = E's portalBinding() at sweep time; never caller-supplied
 }
 
 /// @notice Encrypted deposit payload for TEE decryption
@@ -98,12 +131,22 @@ struct DepositEntry {
     uint256 depositRequestId;
 }
 
+/// @notice Entry for crediting a portal deposit in submitPortalDepositEpoch
+/// @dev Portal analog of DepositEntry. Carries only the portalDepositId; the appended note
+///      commitment travels in a parallel commitments[] array (one note per entry) rather than the
+///      Output[] structs the normal deposit epoch uses, because a portal note carries no recipient
+///      ciphertext (the sweeper has no recipientMPK to encrypt for).
+struct PortalDepositEntry {
+    uint256 portalDepositId;
+}
+
 /// @notice Pending forced withdrawal request for 2-step forced withdrawal
-/// @dev Storage key = keccak256(requester, commitmentsHash). One request per batch.
-///      Each commitment maps to this requestKey via commitmentToRequestKey mapping.
+/// @dev This layout is frozen for proxy compatibility. The requester field is retained but ignored by the current
+///      policy because permissionless proof relayers are not cancellation principals. Each commitment maps to the
+///      request key through commitmentToRequestKey.
 struct ForcedWithdrawalRequest {
     uint64 requestBlock; // Block number when requested
-    address requester; // Who requested the withdrawal (for access control)
+    address requester; // Legacy requester, retained only for storage compatibility
     address withdrawalTo; // Withdrawal destination address
     uint16 tokenId; // Token ID
     uint96 amount; // Withdrawal amount (gross, before fee)
@@ -130,10 +173,20 @@ struct EpochTreeState {
     bool rollover;
 }
 
-/// @notice Auth snapshot state for epoch submissions
-struct AuthSnapshotState {
-    TreeRootPair[] usedAuthRoots;
-    uint256 authSnapshotRound;
+/// @notice Per-root freshness anchor for non-current roots.
+/// @dev supersededBlock == 0 means this root has not been superseded as a tracked historical root.
+struct RootAnchor {
+    uint64 supersededBlock;
+}
+
+/// @notice Batched auth-root freshness status for preflight callers.
+struct AuthRootStatus {
+    uint256 treeNumber;
+    uint256 root;
+    bool isCurrent;
+    bool isRecent;
+    uint64 supersededBlock;
+    uint64 remainingBlocks;
 }
 
 /// @notice Packed auth key info for storage efficiency
@@ -142,6 +195,14 @@ struct AuthKeyInfo {
     uint32 treeIndex; // Index within the tree
     uint32 listIndex; // 1-indexed position in _authKeyList (0 = not exists)
     bool revoked; // Whether the auth key has been revoked
+}
+
+/// @notice Packed spend approval info for storage efficiency
+struct SpendApprovalInfo {
+    uint16 treeNumber; // Tree number where the approval leaf is registered
+    uint32 treeIndex; // Index within the tree
+    bool revoked; // Whether the approval leaf has been revoked
+    bool exists; // Whether this approval id has been used
 }
 
 /// @notice Packed account info for storage efficiency (owner + nonce in single slot)
@@ -153,7 +214,57 @@ struct AccountInfo {
 /// @notice Packed auth tree state for storage efficiency
 struct AuthTreeState {
     uint256 root; // 32 bytes: current tree root (slot 1)
-    uint64 cursor; // 8 bytes: history ring buffer cursor
+    uint64 cursor; // deprecated root-history cursor, kept for proxy storage compatibility
     uint32 leafCount; // 4 bytes: number of leaves in tree
     // 20 bytes remaining in slot 2
+}
+
+// ────────────────────────── Gateway Actions ──────────────────────────
+// GatewayRoute.Sync is the legacy route name for registered gateway executors.
+// Actions are intentionally generic: product-specific meaning lives in signed
+// calldata plus the server-side adapter policy.
+
+/// @notice Routes that approved gateways take. None is the default for unapproved addresses.
+enum GatewayRoute {
+    None,
+    Sync
+}
+
+/// @notice Gateway actions. Zero is invalid so omitted/default action fields fail closed.
+enum GatewayAction {
+    Invalid,
+    ExternalCall
+}
+
+/// @notice Settlement outcome for a gateway-origin deposit.
+/// @dev `Failed` is reserved for ABI compatibility; fatal simulation failures revert instead.
+enum GatewaySettlementOutcome {
+    Executed,
+    Fallback,
+    Failed
+}
+
+/// @notice Rescue authorization kind, bound into the EIP-191 signed payload.
+enum RescueKind {
+    GatewayDeposit
+}
+
+/// @notice The user's future-private receipt for any gateway action.
+struct GatewayReceipt {
+    uint16 outputTokenId;
+    uint96 minOutputAmount;
+    uint256 npk; // strict BN254 field element
+    bytes32 rescueCommitment; // key credential `(pubkey, salt)` or domain-separated authority `(authority, salt)`
+    DepositCiphertext ciphertext; // gateway-origin: encrypts recipientMPK + noteRnd, amount=0 (authoritative amount = on-chain measuredOutputAmount)
+}
+
+/// @notice Sparse gateway slot paired with a withdrawal by withdrawalIndex.
+struct GatewaySlot {
+    uint16 withdrawalIndex;
+    GatewayAction action;
+    uint64 expiryBlock;
+    address target;
+    bytes callData;
+    GatewayReceipt receipt;
+    GatewayReceipt fallbackReceipt;
 }

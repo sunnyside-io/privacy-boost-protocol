@@ -33,6 +33,7 @@ abstract contract Groth16Verifier is Ownable2Step {
     error InvalidParam();
     error EmptyICSources();
     error ICSourceMismatch();
+    error InvalidICSource();
     error InvalidVKConstants();
     error InvalidICLength();
 
