@@ -41,6 +41,10 @@ frontend/
     forced_withdraw_circuit.go  Emergency exit circuit (client-side)
 ```
 
+## Circuit source
+
+The circuit source matches backend release `ceremony/v0.0.5` (commit `b19e261440c38af65498a3e1aed0fab6e2428282`), apart from the public Go module import path. It uses gnark v0.16.3 and gnark-crypto v0.21.0 and requires Go 1.25.13 or later. This identifies the circuit source for ceremony round 3, not a new contract deployment or a re-audit of this repository.
+
 ## Key Properties
 
 - **Self-custodial** -- Users can always exit via forced withdrawal using only their keys and onchain data, no server needed

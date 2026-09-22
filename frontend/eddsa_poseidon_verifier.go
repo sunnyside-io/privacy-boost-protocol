@@ -59,9 +59,11 @@ type eddsaVerifyArtifacts struct {
 	// The verifier enforces this is 0 to reject non-canonical signatures.
 	sTooLargeBit frontend.Variable // 1 if S >= subgroup order, 0 otherwise
 
-	// left and right are the two curve points compared by the signature equation:
-	// left  = S*B8
-	// right = R8 + h*(8*A)
+	// left and right are the two curve points compared by the signature equation,
+	// rearranged so a single double-base multiplication produces the whole
+	// left-hand side:
+	// left  = S*B8 - h*(8*A)
+	// right = R8
 	left  twistededwards.Point
 	right twistededwards.Point
 }
@@ -217,24 +219,36 @@ func computeEdDSAVerifyArtifacts(
 	curve.AssertIsOnCurve(A)
 	curve.AssertIsOnCurve(R8)
 
-	// Calculate A8 = 8*A by doubling 3 times
+	// Calculate A8 = 8*A by doubling 3 times. Multiplying by the cofactor first
+	// annihilates any small-order component of A, so the equation below depends
+	// only on A's prime-order part.
 	A8 := A
 	for i := 0; i < 3; i++ {
 		A8 = curve.Double(A8)
 	}
 
-	// Verify signature equation: S*B8 == R8 + h*(8*A).
-	hA8 := curve.ScalarMul(A8, hValue)
-	curve.AssertIsOnCurve(hA8)
-	right := curve.Add(R8, hA8)
-
-	// Calculate left = S*B8
-	left := curve.ScalarMul(B8, s)
+	// Verify the signature equation in the rearranged form S*B8 - h*(8*A) == R8.
+	//
+	// Moving h*(8*A) to the left lets both scalar multiplications share one
+	// double-and-add loop via DoubleBaseScalarMul, which is what keeps this
+	// verifier on classic eight-coordinate Groth16 proofs. The single-base
+	// ScalarMul gadget decomposes its scalar through an emulated field whose
+	// range checks emit a Groth16 commitment, and that commitment becomes an
+	// extra public input the deployed verifier contracts and the proof
+	// serializer cannot consume.
+	//
+	// DoubleBaseScalarMul is called without algopts.WithIncompleteArithmetic so
+	// it takes its default complete path: the scalar bits are constrained
+	// directly and the accumulator uses the unified twisted Edwards addition
+	// law, so zero scalars and the identity point are handled rather than being
+	// preconditions the caller must guarantee.
+	negA8 := curve.Neg(A8)
+	left := curve.DoubleBaseScalarMul(B8, negA8, s, hValue)
 	curve.AssertIsOnCurve(left)
 
 	return eddsaVerifyArtifacts{
 		sTooLargeBit: sTooLargeBit,
 		left:         left,
-		right:        right,
+		right:        R8,
 	}
 }
