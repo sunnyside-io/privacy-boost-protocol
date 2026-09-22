@@ -53,7 +53,9 @@ uint256 constant MAX_SPEND_APPROVAL_BATCH = 256;
 ///      Version 11 rejects non-canonical signature scalars by comparing against
 ///      the subgroup order minus one. Version 12 expands spend-approval batch
 ///      paths from depth 5 to depth 8, changing the emitted constraints.
-uint32 constant EPOCH_WITNESS_SCHEMA_VERSION = 12;
+///      Version 13 evaluates the EdDSA signature equation with a complete
+///      double-base scalar multiplication, changing the emitted constraints.
+uint32 constant EPOCH_WITNESS_SCHEMA_VERSION = 13;
 
 /// @dev Transfer slots packed into one public withdrawal-mask word. The epoch circuit declares
 ///      ceil(maxTransfers / WITHDRAWAL_MASK_BITS_PER_WORD) mask words, least-significant bit
@@ -68,8 +70,10 @@ uint256 constant WITHDRAWAL_MASK_BITS_PER_WORD = 128;
 ///      the subgroup order minus one. Version 13 expands spend-approval batch
 ///      paths from depth 5 to depth 8 and requires an EdDSA signature over the
 ///      destination-bound claim digest on a direct-key sender refund, changing
+///      the emitted constraints. Version 14 evaluates the EdDSA signature
+///      equation with a complete double-base scalar multiplication, changing
 ///      the emitted constraints.
-uint32 constant GIFT_CLAIM_WITNESS_SCHEMA_VERSION = 13;
+uint32 constant GIFT_CLAIM_WITNESS_SCHEMA_VERSION = 14;
 
 uint8 constant TOKEN_TYPE_ERC20 = 0;
 
