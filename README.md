@@ -45,6 +45,10 @@ frontend/
 
 The circuit source matches backend release `ceremony/v0.0.5` (commit `b19e261440c38af65498a3e1aed0fab6e2428282`), apart from the public Go module import path. It uses gnark v0.16.3 and gnark-crypto v0.21.0 and requires Go 1.25.13 or later. This identifies the circuit source for ceremony round 3, not a new contract deployment or a re-audit of this repository.
 
+## Ceremony provenance
+
+[Round three](https://github.com/sunnyside-io/privacy-boost-ceremony/blob/main/rounds/2026-03.md), `prod-ceremony-2026-03`, finalized on 2026-09-23 with 12 circuits, 16 participants and 192 contributions. The [key-management specification](docs/specs/privacy-boost-protocol/11-key-management-ceremony.md#round-three-finalization-and-planned-upgrade) records the bundle commitment and planned upgrade scope. This records key provenance, not deployment completion.
+
 ## Key Properties
 
 - **Self-custodial** -- Users can always exit via forced withdrawal using only their keys and onchain data, no server needed

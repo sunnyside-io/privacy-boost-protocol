@@ -14,6 +14,20 @@ The protocol uses the gnark Groth16 backend over BN254. Setup is a two-phase MPC
 2. The per-circuit Phase 2 is the only ceremony Privacy Boost runs itself; it is implemented in
 `circuit-setup/`.
 
+## Round-three finalization and planned upgrade
+
+The ceremony `prod-ceremony-2026-03` finalized on 2026-09-23 with 12 circuits, 16 participants and 192 accepted contributions, with 16 per circuit. Its source is backend `ceremony/v0.0.5`, using gnark v0.16.3 and gnark-crypto v0.21.0. The [public round record](https://github.com/sunnyside-io/privacy-boost-ceremony/blob/main/rounds/2026-03.md) records the configuration and finalized bundle digests.
+
+The finalized manifest SHA-256 is `626faf002bf5448fce6bbb3d808ccf71d06eeaa5bddc04775fa675f8932810cf`. Its bundle root is `d7fc87f8f34ad0cd7514384c39813360bf42236da5c860175a9a7ba574f34af1`. Check the manifest against this commitment before independently verifying the transcript with the round-three toolchain.
+
+The planned deployment has three parts:
+
+- Register round-three keys for epoch shapes `s1`, `s5`, `m1`, `m4`, `l1`, `l3`, `sp1`, `w51`, `w201`, forced shape `f13`, and gift-claim shapes `g1`, `g3`.
+- Retain round-two deposit keys for `d1`, `d4`, `d14` and portal keys for `p1`, `p6` unchanged.
+- Disable only epoch shapes `s12`, `s25`, `m8`, `l6`.
+
+Finalization and source provenance do not establish that these keys have been registered on any network. Deployment must separately verify the registered key data and retire the four excluded epoch shapes. The V1 circuit matrix and V1 artifact links below describe the historical first round, not the round-three deployment set.
+
 ## 1. Circuit Set and Setup Inputs
 
 Each `(circuit type, shape)` tuple is a distinct R1CS and therefore a distinct Phase 2 transcript,
