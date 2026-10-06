@@ -12,6 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Sunnyside Labs Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package frontend
 
 import "math/big"
@@ -59,7 +73,15 @@ const (
 	// CountBits is the bit length for counters like NTransfers, FeeTokenCount, CountOld/CountNew.
 	CountBits = 32
 
-	// TokenIDBits is the bit length for token identifiers.
+	// PortalCounterBits is the bit length of a portal sweep counter, fixed by the uint64 counter
+	// the portal record carries on chain rather than chosen for headroom.
+	PortalCounterBits = 64
+
+	// DepositNonceBits is the bit length of a deposit request nonce, fixed by the uint32 nonce
+	// the deposit request carries on chain.
+	DepositNonceBits = 32
+
+	// TokenIDBits is the width of legacy registry IDs. Native asset fields use AddressBits.
 	TokenIDBits = 16
 
 	// FeeBpsBits is the bit length for fee rates (basis points).
@@ -158,7 +180,7 @@ const (
 	ForcedAuthContextVersionEnd      = ForcedAuthContextVersionStart + ForcedAuthContextVersionBits
 	ForcedAuthContextUsedBits        = ForcedAuthContextVersionEnd
 	ForcedAuthContextTotalBits       = 128
-	ForcedAuthContextVersion         = 1
+	ForcedAuthContextVersion         = 2
 	MaxForcedAuthLeafIndex           = (1 << ForcedAuthContextLeafIndexBits) - 1
 
 	// WithdrawalMaskBitsPerWord is the number of transfer slots packed into one public
@@ -171,6 +193,13 @@ const (
 
 	// CountsPackedBitsPerSlot is the number of bits per slot in packed counts (32 bits × 5 slots = 160 bits).
 	CountsPackedBitsPerSlot = 32
+
+	// =============================================================================
+	// Legacy asset snapshot sizing
+	// =============================================================================
+
+	// AssetSnapshotDepth covers the complete uint16 registry ID space, including reserved ID zero.
+	AssetSnapshotDepth = 16
 )
 
 var (
@@ -185,18 +214,24 @@ var (
 	// Used by account-key-related circuits/helpers when hashing account-scoped identifiers.
 	domainAccountId = big.NewInt(1)
 
-	// domainNote domain-separates note-related hashes (NPK/commitment).
-	// Used by circuits that compute:
-	// - NPK = Poseidon(domainNote, MPK, noteRnd)
-	// - Commitment = Poseidon(domainNote, NPK, tokenId, value)
-	domainNote = big.NewInt(2)
+	// domainNoteCommitment opens a legacy note commitment:
+	// Legacy commitment = Poseidon(domainNoteCommitment, NPK, tokenID, value)
+	// Native commitments instead use domainNoteCommitmentV2 and a uint160 token address.
+	domainNoteCommitment = big.NewInt(2)
 
-	// domainNullifier domain-separates nullifier derivation:
+	// domainNotePublicKey derives the note public key in both protocols:
+	// NPK = Poseidon(domainNotePublicKey, MPK, noteRnd)
+	// It deliberately shares tag 2 with domainNoteCommitment. The derivation is unchanged across
+	// both generations, so the two purposes get separate names over one number rather than a new tag.
+	domainNotePublicKey = big.NewInt(2)
+
+	// domainNullifier domain-separates legacy wallet-note nullifier derivation:
 	// Nullifier = Poseidon(domainNullifier + treeNumber*NullifierTreeNumberMultiplier, nullifyingKey, noteLeafIndex).
+	// Native wallet-note nullifiers use domainNullifierV2 instead.
 	domainNullifier = big.NewInt(3)
 
 	// domainRegLeaf domain-separates auth registry leaf hashing.
-	// Leaves bind the spender account key, auth key, and policy fields (owner/expiry/flags).
+	// Key leaf = Poseidon(domainRegLeaf, accountId, authPkX, authPkY, expiry).
 	domainRegLeaf = big.NewInt(4)
 
 	// domainRegNode domain-separates internal auth registry Merkle nodes.
@@ -207,8 +242,9 @@ var (
 	// Used by circuits to bind signatures to an on-chain digest (hi/lo).
 	domainApprove = big.NewInt(6)
 
-	// domainDepositRequest domain-separates the deposit request id digest.
-	// Used by the deposit circuit to bind public request ids to (chainId, pool, depositor, token, amount, nonce, commitmentsHash).
+	// domainDepositRequest domain-separates legacy deposit request IDs, binding
+	// (chainId, pool, depositor, tokenID, amount, nonce, commitmentsHash).
+	// Native requests use domainDepositRequestV2 and a token address instead.
 	domainDepositRequest = big.NewInt(7)
 
 	// domainMPK domain-separates master public key derivation:
@@ -230,8 +266,9 @@ var (
 	// the owner binding is write-once per E but not per H. counter keeps repeated sweeps distinct.
 	domainPortalNote = big.NewInt(10)
 
-	// domainPortalRequest domain-separates the portal-deposit request id digest:
-	// portalDepositId = keccak256(abi.encode(domainPortalRequest, chainId, pool, E, tokenId, amount, counter, H)).
+	// domainPortalRequest domain-separates the legacy portal-deposit request id digest:
+	// portalDepositId = keccak256(abi.encode(domainPortalRequest, chainId, pool, E, tokenID, amount, counter, H)).
+	// Native requests use domainPortalRequestV2 and a token address instead.
 	// It is the sibling of domainDepositRequest for the hidden-recipient sweep path; keccak (not
 	// Poseidon) because this id is only an on-chain key, never a circuit input.
 	domainPortalRequest = big.NewInt(11)
@@ -243,21 +280,21 @@ var (
 	// domainGiftBind domain-separates claimable-transfer gift-note public key derivation:
 	// giftNPK = Poseidon(domainGiftBind, W, Poseidon(domainGiftBind, blind, refundField)).
 	// Used twice (inner + outer) so a gift NPK cannot collide with a normal note NPK
-	// (domainNote), keeping gift notes spendable only by the gift claim circuit.
+	// (domainNoteCommitment), keeping gift notes spendable only by the gift claim circuit.
 	domainGiftBind = big.NewInt(12)
 
 	// domainGiftRefund domain-separates the sender's refund binding:
 	// refundField = Poseidon(domainGiftRefund, senderMPK, refundAfterBlock).
-	// It excludes tokenId/amount (those are bound by C_gift) so the claim branch
+	// It excludes tokenAddress/amount (those are bound by C_gift) so the claim branch
 	// never has to open refundField, preserving the claim/refund shared-nullifier XOR.
 	domainGiftRefund = big.NewInt(13)
 
-	// domainGiftNull domain-separates the gift nullifier, tree-number-bound like a
+	// domainGiftNullifier domain-separates the gift nullifier, tree-number-bound like a
 	// normal note nullifier:
-	// GiftNullifier = Poseidon(domainGiftNull + fundingTreeNumber*NullifierTreeNumberMultiplier, giftNPK, giftLeafIndex).
-	domainGiftNull = big.NewInt(14)
+	// GiftNullifier = Poseidon(domainGiftNullifier + fundingTreeNumber*NullifierTreeNumberMultiplier, giftNPK, giftLeafIndex).
+	domainGiftNullifier = big.NewInt(14)
 
-	// domainGiftSecret domain-separates the secret-bearer claim commitment (off-by-default, audit-gated):
+	// domainGiftSecret domain-separates the secret-bearer claim commitment:
 	// in secret-claim mode the gift's W slot is W = Poseidon(domainGiftSecret, claimSecret), so
 	// proving knowledge of claimSecret authorizes the claim without any wallet/auth binding.
 	domainGiftSecret = big.NewInt(15)
@@ -270,6 +307,50 @@ var (
 	// domainApprovalDisplay binds a Path-B approval blinding to the actual
 	// token and fee constrained by the epoch circuit.
 	domainApprovalDisplay = big.NewInt(18)
+
+	// The address-native separators occupy 19..27. They are distinct from the legacy
+	// tags above because a native note commits to a uint160 token address where the
+	// legacy one commits to a uint16 registry ID, so the two hash families must never
+	// collide. Values are shared with Solidity and the pinned circuit artifacts.
+
+	// domainNoteCommitmentV2 opens a native note commitment:
+	// commitment = Poseidon(domainNoteCommitmentV2, NPK, tokenAddress, value).
+	domainNoteCommitmentV2 = big.NewInt(19)
+
+	// domainNullifierV2 domain-separates native wallet-note nullifier derivation,
+	// tree-number-bound the same way domainNullifier is.
+	domainNullifierV2 = big.NewInt(20)
+
+	// domainDepositRequestV2 domain-separates native deposit request IDs, binding
+	// a token address where domainDepositRequest binds a registry ID.
+	domainDepositRequestV2 = big.NewInt(21)
+
+	// domainPortalNoteV2 domain-separates the native portal-deposit note randomness,
+	// the sibling of domainPortalNote.
+	domainPortalNoteV2 = big.NewInt(22)
+
+	// domainPortalScopeV2 binds native portal randomness to one deployment.
+	domainPortalScopeV2 = big.NewInt(28)
+
+	// domainPortalRequestV2 domain-separates the native portal-deposit request id digest,
+	// the sibling of domainPortalRequest.
+	domainPortalRequestV2 = big.NewInt(23)
+
+	// domainGiftNullifierV2 domain-separates the native gift nullifier,
+	// the sibling of domainGiftNullifier.
+	domainGiftNullifierV2 = big.NewInt(24)
+
+	// domainApprovalDisplayV2 binds a native approval blinding to the actual token
+	// address and fee constrained by the epoch circuit, the sibling of domainApprovalDisplay.
+	domainApprovalDisplayV2 = big.NewInt(25)
+
+	// domainAssetSnapshotLeaf domain-separates a legacy asset snapshot leaf, hashing the
+	// registry ID together with its asset. It must match leaf hashing in the AssetSnapshot contract.
+	domainAssetSnapshotLeaf = big.NewInt(26)
+
+	// domainAssetSnapshotNode domain-separates internal legacy asset snapshot Merkle nodes.
+	// It must match node hashing in the AssetSnapshot contract.
+	domainAssetSnapshotNode = big.NewInt(27)
 )
 
 // EpochWithdrawalMaskWords returns the number of public mask words an epoch circuit of the given

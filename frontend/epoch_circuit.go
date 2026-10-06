@@ -12,6 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Sunnyside Labs Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package frontend
 
 import (
@@ -30,19 +44,21 @@ import (
 // What this circuit enforces (high level):
 // - **Auth**: each active slot uses exactly one auth-registry membership path: either a registered
 //   EdDSA key plus signature, or a Safe spend-approval leaf bound to the same digest.
+//   Finite expiries must cover ProvingTimestamp; only key leaves may have a zero (unlimited) expiry.
 // - **Spend**: each active input note exists in a selected historical commitment tree (Merkle
 //   membership proof) and produces a public nullifier derived from a secret nullifying key.
 // - **Output**: each active slot outputs a commitment consistent with the private output note.
-// - **Fees**: per-slot fees are verified via conservation (outputValue = inputValue - fee) and
-//   accumulated per fee-token id; fee commitments are emitted and appended to the output tree.
+// - **Fees**: per-slot fees are verified via conservation (sum(inputs) = sum(outputs) + fee) and
+//   accumulated per fee-token address; fee commitments are emitted and appended to the output tree.
 //   Fee calculation is done off-chain; the circuit only enforces the balance equation.
-// - **Tree update**: outputs and fee notes are appended to the active tree (with optional
-//   rollover) and the resulting `(RootNew, CountNew)` matches public outputs.
+// - **Tree update**: note outputs and fee notes are appended to the active tree (with optional
+//   rollover); public withdrawal markers are excluded. The resulting `(RootNew, CountNew)`
+//   matches public outputs.
 //
 // Multi-tree support:
 // - `Pub.NoteKnownRoots` provides roots of historical commitment trees (size `Shape.MaxNoteRootsPerProof`).
-// - Each transfer input selects which tree it spends from via `Priv.InputNoteTreeNumber[t]`.
-// - Outputs (including fee outputs) are appended to the current active tree.
+// - Each transfer input selects which tree it spends from via `Priv.InputNoteTreeNumber[t][i]`.
+// - Note outputs (including fee notes) are appended to the current active tree.
 //
 // Rollover semantics:
 // - `Pub.Rollover = 0`: start from `(CountOld, NoteFrontierOld)`.
@@ -55,9 +71,10 @@ import (
 // - Constraints for inactive slots are gated by `transferActive[t]` / `feeActive[j]`.
 //
 // What this circuit does NOT prove:
-// - It does not "interpret" auth leaf fields (expiry/flags) beyond hashing them into the auth
-//   registry leaf and proving membership. Semantics must be enforced by the contract/offchain logic
-//   that defines what an auth leaf means.
+// - It does not prove that ProvingTimestamp is recent; the contract bounds it against the
+//   on-chain clock before accepting the proof.
+// - It enforces key or approval authorization and expiry against ProvingTimestamp, but relies on
+//   the contract's on-chain clock check for the freshness of that timestamp.
 // - It does not prove uniqueness of nullifiers across transfers within the circuit; uniqueness is
 //   enforced on-chain by checking a nullifier mapping.
 // - It does not prove that a given (NoteKnownRoots/AuthKnownRoots) array is consistent with the
@@ -89,13 +106,14 @@ type EpochShape struct {
 	MaxTransfers          int // number of transfer slots in the circuit instance
 	MaxInputsPerTransfer  int // maximum inputs per single transfer
 	MaxOutputsPerTransfer int // maximum outputs per single transfer
-	MaxFeeTokens          int // maximum distinct fee token ids supported
+	MaxFeeTokens          int // maximum distinct fee token addresses supported
 	NoteDepth             int // depth of note commitment trees (leaf capacity = 2^NoteDepth)
 	AuthDepth             int // depth of auth registry trees
 	MaxNoteRootsPerProof  int // number of note roots provided in a proof
 	MaxAuthRootsPerProof  int // number of auth roots provided in a proof
 }
 
+// Exported field spelling is frozen for witness-builder compatibility. New identifiers use Go initialisms.
 type EpochPublicInputs struct {
 	// Commitment tree roots (multi-tree input support).
 	NoteKnownRoots             []frontend.Variable `gnark:",public"` // [MaxNoteRootsPerProof] historical note commitment tree roots
@@ -119,7 +137,6 @@ type EpochPublicInputs struct {
 	ApproveDigestLo []frontend.Variable   `gnark:",public"` // [MaxTransfers] one digest per transfer
 
 	// Fee public outputs.
-	FeeNPK              frontend.Variable   `gnark:",public"` // fee recipient's Note Public Key
 	FeeCommitmentsOut   []frontend.Variable `gnark:",public"` // [MaxFeeTokens] fee note commitments
 	FeeTransferDigestHi frontend.Variable   `gnark:",public"` // high 128 bits of the fee-transfer metadata digest
 	FeeTransferDigestLo frontend.Variable   `gnark:",public"` // low 128 bits of the fee-transfer metadata digest
@@ -131,16 +148,17 @@ type EpochPublicInputs struct {
 	WithdrawalMaskPacked []frontend.Variable `gnark:",public"` // [EpochWithdrawalMaskWords(MaxTransfers)]
 }
 
+// Exported field spelling is frozen for witness-builder compatibility. New identifiers use Go initialisms.
 type EpochPrivateInputs struct {
 	// Per-transfer input/output counts.
 	InputsPerTransfer  []frontend.Variable // [MaxTransfers] how many inputs for transfer t
 	OutputsPerTransfer []frontend.Variable // [MaxTransfers] how many outputs for transfer t
 
 	// Per-transfer auth/signature witness.
-	AuthTreeNumber   []frontend.Variable // [MaxTransfers] which auth tree contains the auth key (15-bit global id)
-	SpenderAccountId []frontend.Variable // [MaxTransfers] used for MPK derivation and auth leaf hashing
-	TransferTokenID  []frontend.Variable // [MaxTransfers] slot token id; all input/output token ids must match it
-	NullifyingKey    []frontend.Variable // [MaxTransfers] secret; used for MPK and nullifier derivation
+	AuthTreeNumber       []frontend.Variable // [MaxTransfers] which auth tree contains the auth key (15-bit global id)
+	SpenderAccountId     []frontend.Variable // [MaxTransfers] used for MPK derivation and auth leaf hashing
+	TransferTokenAddress []frontend.Variable // [MaxTransfers] slot token address; all input/output token addresses must match it
+	NullifyingKey        []frontend.Variable // [MaxTransfers] secret; used for MPK and nullifier derivation
 
 	AuthPkX            []frontend.Variable   // [MaxTransfers] auth pubkey X
 	AuthPkY            []frontend.Variable   // [MaxTransfers] auth pubkey Y
@@ -175,9 +193,16 @@ type EpochPrivateInputs struct {
 	// Active output tree witness (before appending).
 	NoteFrontierOld []frontend.Variable // [NoteDepth] frontier witness for active output tree
 
-	// Fee outputs witness.
-	FeeTokenID []frontend.Variable // [MaxFeeTokens] fee token ids (active first, then zero)
-	FeeValue   []frontend.Variable // [MaxFeeTokens] total fee per token (active first, then zero)
+	// Fee outputs witness. FeeNPK is private so the published fee commitments cannot be
+	// brute-forced: with a public key an observer could hash candidate token addresses against
+	// plausible aggregate fees and match the commitment, because both of those have small ranges.
+	// The commitment carries no blinding term of its own, so the preimage stays unguessable only
+	// while the producer draws fresh per-batch note randomness for this key. In circuit the value
+	// is constrained by its reserved-range separation alone, and the key must never re-enter the
+	// public inputs or the calldata.
+	FeeNPK          frontend.Variable   // fee recipient's Note Public Key, shared by every bucket in the batch
+	FeeTokenAddress []frontend.Variable // [MaxFeeTokens] fee token addresses (active first, then zero)
+	FeeValue        []frontend.Variable // [MaxFeeTokens] total fee per token (active first, then zero)
 }
 
 // =============================================================================
@@ -246,36 +271,36 @@ func NewEpochCircuit(maxTransfers, maxInputsPerTransfer, maxOutputsPerTransfer, 
 			WithdrawalMaskPacked: newZeroedMaskWords(EpochWithdrawalMaskWords(maxTransfers)),
 		},
 		Priv: EpochPrivateInputs{
-			InputsPerTransfer:   make([]frontend.Variable, maxTransfers),
-			OutputsPerTransfer:  make([]frontend.Variable, maxTransfers),
-			AuthTreeNumber:      make([]frontend.Variable, maxTransfers),
-			SpenderAccountId:    make([]frontend.Variable, maxTransfers),
-			TransferTokenID:     make([]frontend.Variable, maxTransfers),
-			NullifyingKey:       make([]frontend.Variable, maxTransfers),
-			AuthPkX:             make([]frontend.Variable, maxTransfers),
-			AuthPkY:             make([]frontend.Variable, maxTransfers),
-			AuthSigR8x:          make([]frontend.Variable, maxTransfers),
-			AuthSigR8y:          make([]frontend.Variable, maxTransfers),
-			AuthSigS:            make([]frontend.Variable, maxTransfers),
-			UseApproval:         make([]frontend.Variable, maxTransfers),
-			Blinding:            make([]frontend.Variable, maxTransfers),
-			DisplayBindingSalt:  make([]frontend.Variable, maxTransfers),
-			BatchIndex:          make([]frontend.Variable, maxTransfers),
-			BatchSiblings:       make([][]frontend.Variable, maxTransfers),
-			AuthExpiry:          make([]frontend.Variable, maxTransfers),
-			AuthLeafIndex:       make([]frontend.Variable, maxTransfers),
-			AuthPathElements:    make([][]frontend.Variable, maxTransfers),
-			FeePerTransfer:      make([]frontend.Variable, maxTransfers),
-			InputNoteTreeNumber: inputNoteTreeNumber,
-			InputValue:          inputValue,
-			InputNoteRnd:        inputNoteRnd,
-			InputNoteLeafIndex:  inputNoteLeafIndex,
-			InputNotePath:       inputNotePath,
-			OutputNPK:           outputNPK,
-			OutputValue:         outputValue,
-			NoteFrontierOld:     make([]frontend.Variable, noteDepth),
-			FeeTokenID:          make([]frontend.Variable, maxFeeTokens),
-			FeeValue:            make([]frontend.Variable, maxFeeTokens),
+			InputsPerTransfer:    make([]frontend.Variable, maxTransfers),
+			OutputsPerTransfer:   make([]frontend.Variable, maxTransfers),
+			AuthTreeNumber:       make([]frontend.Variable, maxTransfers),
+			SpenderAccountId:     make([]frontend.Variable, maxTransfers),
+			TransferTokenAddress: make([]frontend.Variable, maxTransfers),
+			NullifyingKey:        make([]frontend.Variable, maxTransfers),
+			AuthPkX:              make([]frontend.Variable, maxTransfers),
+			AuthPkY:              make([]frontend.Variable, maxTransfers),
+			AuthSigR8x:           make([]frontend.Variable, maxTransfers),
+			AuthSigR8y:           make([]frontend.Variable, maxTransfers),
+			AuthSigS:             make([]frontend.Variable, maxTransfers),
+			UseApproval:          make([]frontend.Variable, maxTransfers),
+			Blinding:             make([]frontend.Variable, maxTransfers),
+			DisplayBindingSalt:   make([]frontend.Variable, maxTransfers),
+			BatchIndex:           make([]frontend.Variable, maxTransfers),
+			BatchSiblings:        make([][]frontend.Variable, maxTransfers),
+			AuthExpiry:           make([]frontend.Variable, maxTransfers),
+			AuthLeafIndex:        make([]frontend.Variable, maxTransfers),
+			AuthPathElements:     make([][]frontend.Variable, maxTransfers),
+			FeePerTransfer:       make([]frontend.Variable, maxTransfers),
+			InputNoteTreeNumber:  inputNoteTreeNumber,
+			InputValue:           inputValue,
+			InputNoteRnd:         inputNoteRnd,
+			InputNoteLeafIndex:   inputNoteLeafIndex,
+			InputNotePath:        inputNotePath,
+			OutputNPK:            outputNPK,
+			OutputValue:          outputValue,
+			NoteFrontierOld:      make([]frontend.Variable, noteDepth),
+			FeeTokenAddress:      make([]frontend.Variable, maxFeeTokens),
+			FeeValue:             make([]frontend.Variable, maxFeeTokens),
 		},
 	}
 
@@ -313,6 +338,12 @@ type epochInternalState struct {
 	isWithdrawal    []Bool              // isWithdrawal[t] := bit t of the public withdrawal mask
 	provingTimeBits []frontend.Variable // little-endian bits of Pub.ProvingTimestamp
 
+	// Fee accumulators, filled by applyFeeAndAccumulate as transfers are processed and
+	// consumed by processFeeCommitments. feeUsed[j] records that some active transfer
+	// routed to bucket j, so an active bucket is backed by a transfer even at zero fee.
+	feeUsed []Bool
+	feeSums []frontend.Variable
+
 	// pendingLeaves collects the commitments to append, in tree order: one packed block per
 	// transfer slot (its active outputs), then one for the active fee commitments. They are
 	// appended in a single batch by `applyBatchAppend` rather than one leaf at a time.
@@ -330,22 +361,17 @@ type epochInternalState struct {
 // Define
 // =============================================================================
 func (c *EpochCircuit) Define(api frontend.API) error {
-	// Build all sizing-dependent selectors and perform basic range/bounds validation.
+	// Build all sizing-dependent selectors, zero the fee accumulators, and perform basic
+	// range/bounds validation.
 	state := c.validateInputs(api)
-
-	// Accumulate per-token fees across all active transfers.
-	feeSums := make([]frontend.Variable, c.Shape.MaxFeeTokens)
-	for j := 0; j < c.Shape.MaxFeeTokens; j++ {
-		feeSums[j] = 0
-	}
 
 	// Verify authorization signature and registry membership for each active transfer slot.
 	c.verifyAuth(api, state)
 	// Apply per-transfer constraints and collect transfer outputs for the tree append.
-	// Also enforces canonical NoteKnownRoots coverage based on input membership usage.
-	c.processTransfers(api, &state, feeSums)
+	// Unused valid public root pairs may provide padding without identifying the exact used subset.
+	c.processTransfers(api, &state)
 	// Emit fee commitments and collect them for the tree append.
-	c.processFeeCommitments(api, &state, feeSums)
+	c.processFeeCommitments(api, &state)
 	// Append every collected commitment to the output tree in one batch.
 	c.applyBatchAppend(api, &state)
 	// Bind the final tree state to public outputs.
@@ -379,6 +405,14 @@ func (c *EpochCircuit) validateInputs(api frontend.API) epochInternalState {
 	// Range-check fee output values (active/inactive semantics are enforced later).
 	c.validateFeeOutputValues(api)
 
+	// Zero the fee accumulators for this build of the constraint system.
+	feeUsed := make([]Bool, c.Shape.MaxFeeTokens)
+	feeSums := make([]frontend.Variable, c.Shape.MaxFeeTokens)
+	for j := 0; j < c.Shape.MaxFeeTokens; j++ {
+		feeUsed[j] = False()
+		feeSums[j] = 0
+	}
+
 	return epochInternalState{
 		currentCount:    currentCount,
 		currentFrontier: currentFrontier,
@@ -386,6 +420,8 @@ func (c *EpochCircuit) validateInputs(api frontend.API) epochInternalState {
 		transferActive:  transferActive,
 		isWithdrawal:    isWithdrawal,
 		provingTimeBits: provingTimeBits,
+		feeUsed:         feeUsed,
+		feeSums:         feeSums,
 		countOld:        countOld,
 		countNew:        countNew,
 		rollover:        rollover,
@@ -463,28 +499,28 @@ func (c *EpochCircuit) validatePublicInputsAndInitTreeState(api frontend.API) (
 	return currentCount, currentFrontier, countOld, countNew, nTransfers, feeTokenCount, rollover, provingTimeBits
 }
 
-// validateFeeTokenInputs validates the fee token id list:
+// validateFeeTokenInputs validates the fee token address list:
 // - The first `feeTokenCount` entries are active, non-zero, and pairwise distinct.
 // - The remaining entries are zero.
 // It returns `feeActive[j] := (j < feeTokenCount)` selectors used for gating later constraints.
 func (c *EpochCircuit) validateFeeTokenInputs(api frontend.API, feeTokenCount frontend.Variable) []Bool {
-	// Determine which fee slots are active and enforce FeeTokenID semantics for each slot.
+	// Determine which fee slots are active and enforce FeeTokenAddress semantics for each slot.
 	feeActive := make([]Bool, c.Shape.MaxFeeTokens)
 	for j := 0; j < c.Shape.MaxFeeTokens; j++ {
 		feeSlotActive := isGreaterThanConst(api, feeTokenCount, uint64(j), CountBits)
 		feeActive[j] = feeSlotActive
 
-		// Active fee slots must have non-zero token ids; inactive slots must be zero.
-		AssertIsNBits(api, c.Priv.FeeTokenID[j], TokenIDBits)
-		AssertIsNonZeroIf(api, feeSlotActive, c.Priv.FeeTokenID[j])
-		AssertIsZeroIf(api, Not(api, feeSlotActive), c.Priv.FeeTokenID[j])
+		// Active fee slots must have non-zero token addresses; inactive slots must be zero.
+		AssertIsNBits(api, c.Priv.FeeTokenAddress[j], AddressBits)
+		AssertIsNonZeroIf(api, feeSlotActive, c.Priv.FeeTokenAddress[j])
+		AssertIsZeroIf(api, Not(api, feeSlotActive), c.Priv.FeeTokenAddress[j])
 	}
 
-	// Active fee token ids must be pairwise distinct.
+	// Active fee token addresses must be pairwise distinct.
 	for j := 0; j < c.Shape.MaxFeeTokens; j++ {
 		for k := j + 1; k < c.Shape.MaxFeeTokens; k++ {
 			bothActive := And(api, feeActive[j], feeActive[k])
-			AssertIsDifferentIf(api, bothActive, c.Priv.FeeTokenID[j], c.Priv.FeeTokenID[k])
+			AssertIsDifferentIf(api, bothActive, c.Priv.FeeTokenAddress[j], c.Priv.FeeTokenAddress[k])
 		}
 	}
 
@@ -543,6 +579,10 @@ func (c *EpochCircuit) decodeWithdrawalMask(api frontend.API, transferActive []B
 func (c *EpochCircuit) validatePerTransferInputs(api frontend.API, transferActive []Bool) {
 	for t := 0; t < c.Shape.MaxTransfers; t++ {
 		transferActiveT := transferActive[t]
+
+		// Every active transfer matches exactly one range-checked fee bucket
+		// in applyFeeAndAccumulate; inactive assets are pinned to zero here.
+		AssertIsZeroIf(api, Not(api, transferActiveT), c.Priv.TransferTokenAddress[t])
 
 		// Validate InputsPerTransfer and OutputsPerTransfer counts.
 		AssertIsLessOrEqualIf(api, transferActiveT, c.Priv.InputsPerTransfer[t], uint64(c.Shape.MaxInputsPerTransfer), CountBits)
@@ -604,11 +644,11 @@ func (c *EpochCircuit) verifyAuth(api frontend.API, state epochInternalState) {
 		)
 		displayBlinding := Poseidon2T4(
 			api,
-			domainApprovalDisplay,
+			domainApprovalDisplayV2,
 			c.Priv.DisplayBindingSalt[t],
 			c.Priv.SpenderAccountId[t],
 			c.Priv.AuthExpiry[t],
-			c.Priv.TransferTokenID[t],
+			c.Priv.TransferTokenAddress[t],
 			c.Priv.FeePerTransfer[t],
 			senderMPK,
 		)
@@ -668,36 +708,25 @@ func (c *EpochCircuit) verifyAuth(api frontend.API, state epochInternalState) {
 // - N input note membership and nullifier constraints,
 // - M output commitment constraints,
 // - fee conservation (sum(inputs) = sum(outputs) + fee) and fee accumulation,
-// - collect the M output commitments for the batched tree append.
+// - collect note commitments, excluding public payout markers, for the batched tree append.
 func (c *EpochCircuit) processTransfers(
 	api frontend.API,
 	state *epochInternalState,
-	feeSums []frontend.Variable,
 ) {
-	noteKnownTreeNumbers := unpackSlots(
-		api,
-		c.Pub.NoteKnownTreeNumbersPacked,
-		len(c.Pub.NoteKnownRoots),
-		TreeNumberBitsPerSlot,
-	)
-
-	// Track which NoteKnownRoots slots are referenced by active input notes.
-	slotUsedByInputs := make([]Bool, c.Shape.MaxNoteRootsPerProof)
-	for s := 0; s < c.Shape.MaxNoteRootsPerProof; s++ {
-		slotUsedByInputs[s] = False()
-	}
-
 	// Process each transfer slot. Inactive slots are gated by transferActive[t].
 	for t := 0; t < c.Shape.MaxTransfers; t++ {
 		transferActive := state.transferActive[t]
 		nInputs := c.Priv.InputsPerTransfer[t]
 		nOutputs := c.Priv.OutputsPerTransfer[t]
 
+		// Every input in a transfer derives its NPK from the same sender MPK.
+		mpk := Poseidon2T4(api, domainMPK, c.Priv.SpenderAccountId[t], c.Priv.NullifyingKey[t])
+
 		// Process N inputs: enforce input-note validity, membership, and nullifier.
 		inputValueSum := frontend.Variable(0)
 		for i := 0; i < c.Shape.MaxInputsPerTransfer; i++ {
 			inputActive := And(api, transferActive, isGreaterThanConst(api, nInputs, uint64(i), CountBits))
-			c.assertInputNotes(api, inputActive, t, i, noteKnownTreeNumbers, slotUsedByInputs)
+			c.assertInputNotes(api, inputActive, t, i, mpk)
 			c.assertNullifier(api, inputActive, t, i)
 			inputValueSum = api.Add(inputValueSum, api.Mul(inputActive.AsField(), c.Priv.InputValue[t][i]))
 		}
@@ -724,39 +753,39 @@ func (c *EpochCircuit) processTransfers(
 			newPrefixPackedList(api, leafValues, leafActive))
 
 		// Enforce conservation: sum(inputs) = sum(outputs) + fee, and accumulate fees.
-		c.applyFeeAndAccumulate(api, transferActive, t, inputValueSum, outputValueSum, feeSums)
+		c.applyFeeAndAccumulate(api, state, transferActive, t, inputValueSum, outputValueSum)
 	}
-
-	// Enforce canonical NoteKnownRoots coverage (every non-zero root must be consumed by an input).
-	c.assertNoteKnownRootsCoverage(api, slotUsedByInputs)
 }
 
 // processFeeCommitments enforces fee bucket correctness and queues fee commitments for the
 // tree append:
-// - `FeeValue[j]` must equal the accumulated sum for that token id (when active),
+// - `FeeValue[j]` must equal the accumulated sum for that token address (when active),
 // - the public fee commitment must match the computed commitment (when active),
 // - active fee commitments are collected as the last block of leaves to append.
-func (c *EpochCircuit) processFeeCommitments(api frontend.API, state *epochInternalState, feeSums []frontend.Variable) {
+func (c *EpochCircuit) processFeeCommitments(api frontend.API, state *epochInternalState) {
 	// One public key serves every fee bucket, so the reserved range costs one refusal for the whole
 	// batch rather than one per slot. The refusal is unconditional because
 	// validatePublicInputsAndInitTreeState already requires 1 <= FeeTokenCount, so every satisfying
 	// witness mints a fee note and there is no shape for which a gate would legitimately skip it.
-	// See the policy block in spendable_npk.go for why this site is refused and the per-output-slot
-	// sites are not.
-	AssertSpendableNPK(api, c.Pub.FeeNPK)
+	// Every active real output key is also checked under its slot gate in assertOutputNotes.
+	// Only the public withdrawal marker is exempt from the spendable-key check.
+	AssertSpendableNPK(api, c.Priv.FeeNPK)
 
 	for j := 0; j < c.Shape.MaxFeeTokens; j++ {
+		// An active bucket must represent a transfer token, even when its total fee is zero.
+		AssertIsTrueIf(api, state.feeActive[j], state.feeUsed[j])
+
 		// Bind the fee totals to the accumulated per-token sums (active slots) and enforce zero padding (inactive slots).
-		AssertEqualIf(api, state.feeActive[j], c.Priv.FeeValue[j], feeSums[j])
+		AssertEqualIf(api, state.feeActive[j], c.Priv.FeeValue[j], state.feeSums[j])
 		AssertIsZeroIf(api, Not(api, state.feeActive[j]), c.Priv.FeeValue[j])
 
-		// Fee commitment = Hash(domainNote, FeeNPK, FeeTokenID, FeeValue)
+		// Fee commitment = Poseidon(domainNoteCommitmentV2, FeeNPK, FeeTokenAddress, FeeValue)
 		// Compute and bind the fee commitment for this fee bucket (active slots) and enforce zero padding (inactive slots).
 		feeCommitment := Poseidon2T4(
 			api,
-			domainNote,
-			c.Pub.FeeNPK,
-			c.Priv.FeeTokenID[j],
+			domainNoteCommitmentV2,
+			c.Priv.FeeNPK,
+			c.Priv.FeeTokenAddress[j],
 			c.Priv.FeeValue[j],
 		)
 		AssertEqualIf(api, state.feeActive[j], feeCommitment, c.Pub.FeeCommitmentsOut[j])
@@ -812,45 +841,29 @@ func (c *EpochCircuit) assertFinalState(api frontend.API, state epochInternalSta
 // Per-transfer helpers
 // =============================================================================
 
-// assertNoteKnownRootsCoverage enforces canonical coverage of NoteKnownRoots:
-// every non-zero (treeNumber, root) slot must be referenced by at least one active input note
-// membership proof.
-func (c *EpochCircuit) assertNoteKnownRootsCoverage(
-	api frontend.API,
-	slotUsedByInputs []Bool,
-) {
-	for s := 0; s < c.Shape.MaxNoteRootsPerProof; s++ {
-		slotActive := isNonZero(api, c.Pub.NoteKnownRoots[s])
-		AssertIsTrueIf(api, slotActive, slotUsedByInputs[s])
-	}
-}
-
 // assertInputNotes enforces that the input note at index [transferIdx][inputIdx] exists in the selected
 // commitment tree.
 func (c *EpochCircuit) assertInputNotes(
 	api frontend.API,
 	inputActive Bool,
 	transferIdx, inputIdx int,
-	noteKnownTreeNumbers []frontend.Variable,
-	slotUsedByInputs []Bool,
+	mpk frontend.Variable,
 ) {
-	AssertIsNonZeroIf(api, inputActive, c.Priv.TransferTokenID[transferIdx])
+	AssertIsNonZeroIf(api, inputActive, c.Priv.TransferTokenAddress[transferIdx])
 
-	// Compute MPK = Hash(domainMPK, SpenderAccountId, NullifyingKey)
-	mpk := Poseidon2T4(api, domainMPK, c.Priv.SpenderAccountId[transferIdx], c.Priv.NullifyingKey[transferIdx])
-	// InputNPK = Hash(domainNote, MPK, InputNoteRnd)
-	inputNPK := Poseidon2T4(api, domainNote, mpk, c.Priv.InputNoteRnd[transferIdx][inputIdx])
+	// InputNPK = Hash(domainNotePublicKey, MPK, InputNoteRnd)
+	inputNPK := Poseidon2T4(api, domainNotePublicKey, mpk, c.Priv.InputNoteRnd[transferIdx][inputIdx])
 
-	// Refuse the reserved low range. Markers no longer enter new trees, but they are still leaves
-	// of every root minted before this change, so the range is what keeps a historical marker
-	// unopenable rather than merely absent.
+	// Preserve key separation from public payout markers, whose NPK position
+	// contains a uint160 address. Native markers are proof outputs, not note leaves.
 	AssertSpendableNPKIf(api, inputActive, inputNPK)
-	// inputCommitment = Hash(domainNote, InputNPK, TokenID, InputValue)
+
+	// inputCommitment = Poseidon(domainNoteCommitmentV2, InputNPK, TokenAddress, InputValue)
 	inputCommitment := Poseidon2T4(
 		api,
-		domainNote,
+		domainNoteCommitmentV2,
 		inputNPK,
-		c.Priv.TransferTokenID[transferIdx],
+		c.Priv.TransferTokenAddress[transferIdx],
 		c.Priv.InputValue[transferIdx][inputIdx],
 	)
 	AssertIsNonZeroIf(api, inputActive, inputCommitment)
@@ -858,21 +871,12 @@ func (c *EpochCircuit) assertInputNotes(
 	// Prove membership: computed root must match a known root AND tree number must match.
 	rootComputed := computeRoot(api, inputCommitment, c.Priv.InputNoteLeafIndex[transferIdx][inputIdx], c.Priv.InputNotePath[transferIdx][inputIdx], c.Shape.NoteDepth)
 	AssertRootWithTreeNumberIf(api, inputActive, rootComputed, c.Priv.InputNoteTreeNumber[transferIdx][inputIdx], c.Pub.NoteKnownRoots, c.Pub.NoteKnownTreeNumbersPacked)
-
-	// Track slot usage for canonical NoteKnownRoots coverage.
-	// A slot is "used by inputs" if any active input proves membership against the same (treeNumber, root) pair.
-	for s := 0; s < c.Shape.MaxNoteRootsPerProof; s++ {
-		eqRoot := IsEqual(api, rootComputed, c.Pub.NoteKnownRoots[s])
-		eqTree := IsEqual(api, c.Priv.InputNoteTreeNumber[transferIdx][inputIdx], noteKnownTreeNumbers[s])
-		pairMatch := And(api, eqRoot, eqTree)
-		slotUsedByInputs[s] = Or(api, slotUsedByInputs[s], And(api, inputActive, pairMatch))
-	}
 }
 
 // assertNullifier enforces that the public nullifier at index [transferIdx][inputIdx] matches the expected
 // nullifier for the spent note.
 func (c *EpochCircuit) assertNullifier(api frontend.API, inputActive Bool, transferIdx, inputIdx int) {
-	combinedDomain := api.Add(domainNullifier, api.Mul(c.Priv.InputNoteTreeNumber[transferIdx][inputIdx], NullifierTreeNumberMultiplier))
+	combinedDomain := api.Add(domainNullifierV2, api.Mul(c.Priv.InputNoteTreeNumber[transferIdx][inputIdx], NullifierTreeNumberMultiplier))
 	nullifier := Poseidon2T4(api, combinedDomain, c.Priv.NullifyingKey[transferIdx], c.Priv.InputNoteLeafIndex[transferIdx][inputIdx])
 	AssertEqualIf(api, inputActive, nullifier, c.Pub.Nullifiers[transferIdx][inputIdx])
 	// Zero/non-zero invariant: binds per-transfer input counts between circuit and contract.
@@ -884,13 +888,13 @@ func (c *EpochCircuit) assertNullifier(api frontend.API, inputActive Bool, trans
 // expected commitment, and that the key it is built over is spendable.
 //
 // Output zero of a withdrawal is the one slot exempt from the range, because it is not a note at
-// all: it is the public payout marker Poseidon(domainNote, uint160(to), tokenId, amount), whose key
+// all: it is the public payout marker Poseidon(domainNoteCommitmentV2, uint160(to), tokenAddress, amount), whose key
 // position holds the recipient address and therefore always sits inside the reserved range by
 // construction. treeLeavesForTransfer drops that slot before the tree append, so no reserved-range
-// leaf is ever created. Every other output slot is a real note and is refused, which means a
-// recipient can no longer be handed a commitment no spend relation will open.
+// leaf is ever created. Every other active output is a real note and must have a spendable NPK,
+// so a sender cannot choose a reserved-range key that the spend relation will reject.
 func (c *EpochCircuit) assertOutputNotes(api frontend.API, outputActive, isWithdrawal Bool, transferIdx, outputIdx int) {
-	// The marker exemption is a compile-time slot position combined with a witness flag, so for
+	// The marker exemption is a compile-time slot position combined with a public mask bit, so for
 	// every slot past zero the gate collapses to outputActive and costs nothing extra.
 	npkChecked := outputActive
 	if outputIdx == 0 {
@@ -901,9 +905,9 @@ func (c *EpochCircuit) assertOutputNotes(api frontend.API, outputActive, isWithd
 	// Compute and bind the public output commitment.
 	outputCommitment := Poseidon2T4(
 		api,
-		domainNote,
+		domainNoteCommitmentV2,
 		c.Priv.OutputNPK[transferIdx][outputIdx],
-		c.Priv.TransferTokenID[transferIdx],
+		c.Priv.TransferTokenAddress[transferIdx],
 		c.Priv.OutputValue[transferIdx][outputIdx],
 	)
 	AssertEqualIf(api, outputActive, outputCommitment, c.Pub.CommitmentsOut[transferIdx][outputIdx])
@@ -917,7 +921,7 @@ func (c *EpochCircuit) assertOutputNotes(api frontend.API, outputActive, isWithd
 //
 // For an ordinary transfer this is the slot unchanged. For a withdrawal the marker in output zero
 // is removed and every later output shifts down one slot, which keeps the change note's position
-// relative to the other appends and shortens the block by exactly one leaf. Both outputs stay
+// relative to the other appends and shortens the block by exactly one leaf. All outputs stay
 // bound and summed by the caller either way, so removing the marker changes what the tree holds,
 // not what the batch is allowed to move.
 //
@@ -950,10 +954,10 @@ func (c *EpochCircuit) treeLeavesForTransfer(
 // Also accumulates fees into per-token buckets.
 func (c *EpochCircuit) applyFeeAndAccumulate(
 	api frontend.API,
+	state *epochInternalState,
 	transferActive Bool,
 	transferIdx int,
 	inputValueSum, outputValueSum frontend.Variable,
-	feeSums []frontend.Variable,
 ) {
 	fee := c.Priv.FeePerTransfer[transferIdx]
 	AssertIsNBits(api, fee, AmountBits)
@@ -966,12 +970,13 @@ func (c *EpochCircuit) applyFeeAndAccumulate(
 	// Route this transfer's fee into exactly one fee-token bucket.
 	matchCount := frontend.Variable(0)
 	for j := 0; j < c.Shape.MaxFeeTokens; j++ {
-		match := IsEqual(api, c.Priv.TransferTokenID[transferIdx], c.Priv.FeeTokenID[j])
+		match := IsEqual(api, c.Priv.TransferTokenAddress[transferIdx], c.Priv.FeeTokenAddress[j])
 		matchCount = api.Add(matchCount, match.AsField())
 
-		// Accumulate fee into the matching bucket.
+		// Reuse the asset match to track bucket coverage and accumulate its fee.
 		enabled := And(api, transferActive, match)
-		feeSums[j] = api.Add(feeSums[j], api.Mul(enabled.AsField(), fee))
+		state.feeUsed[j] = Or(api, state.feeUsed[j], enabled)
+		state.feeSums[j] = api.Add(state.feeSums[j], api.Mul(enabled.AsField(), fee))
 	}
 
 	// Active transfers must match exactly one bucket.

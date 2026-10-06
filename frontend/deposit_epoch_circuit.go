@@ -12,6 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Sunnyside Labs Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package frontend
 
 import (
@@ -43,7 +57,7 @@ import (
 //
 // Readability invariants used throughout:
 // - `requestActive[r] := (r < Pub.NRequests)` and inactive request slots are zero padded.
-// - `commitmentActive[i] := (i < Pub.NTotalCommitments)` and inactive commitment slots are zero padded.
+// - `commitmentActive[i] := (i < Pub.NAppends)` and inactive commitment slots are zero padded.
 //
 // What this circuit does NOT prove:
 //   - It does not prove that `NoteKnownRoots` corresponds to the contract's root history; the contract verifies that.
@@ -52,7 +66,7 @@ import (
 //     provided public request ids and tree transition.
 //
 // Witness author notes:
-// - Arrays are fixed-size. Only the first `Pub.NRequests` / `Pub.NTotalCommitments` entries are active; all others MUST be zero.
+// - Arrays are fixed-size. Only the first `Pub.NRequests` / `Pub.NAppends` entries are active; all others MUST be zero.
 // - `CommitmentsOut` must be sorted by request: commitments for request 0 first, then request 1, etc.
 // - `CommitmentCounts[r]` is the number of commitments for request r and must be non-zero for active requests.
 type DepositEpochCircuit struct {
@@ -72,24 +86,26 @@ type DepositEpochShape struct {
 	MaxSlots             int // shared maximum for both request slots and commitment slots
 	MerkleDepth          int // depth of note commitment trees (leaf capacity = 2^MerkleDepth)
 	MaxNoteRootsPerProof int // number of note roots provided in a proof
-	// TODO(refactor): disambiguate MaxSlots into MaxRequests and MaxCommitments.
+	// Requests and commitments intentionally share one capacity in this witness schema.
+	// Splitting them changes the public vector and requires a separately versioned circuit.
 }
 
+// DepositEpochPublicInputs is the deposit circuit's public vector, in verifier order.
+// Field order is shared with LibPublicInputs.buildDepositInputs in Solidity. Reordering
+// fields changes the verifier's public vector and requires new proving keys.
+// Exported field spelling is frozen for witness-builder compatibility. New identifiers use Go initialisms.
 type DepositEpochPublicInputs struct {
-	// Tree state.
-	ChainId                    frontend.Variable   `gnark:",public"` // chain id included in request id digest
-	PoolAddress                frontend.Variable   `gnark:",public"` // pool address included in request id digest
-	NoteKnownRoots             []frontend.Variable `gnark:",public"` // [MaxNoteRootsPerProof] historical note commitment tree roots
-	NoteKnownTreeNumbersPacked frontend.Variable   `gnark:",public"` // packed tree numbers (15 bits each)
-	ActiveNoteTreeNumber       frontend.Variable   `gnark:",public"` // selects which NoteKnownRoots is the active output tree
-	CountOld                   frontend.Variable   `gnark:",public"` // old leaf count in the active output tree
-	RootNew                    frontend.Variable   `gnark:",public"` // root after appending all active commitments
-	CountNew                   frontend.Variable   `gnark:",public"` // new leaf count after appends
-	Rollover                   frontend.Variable   `gnark:",public"` // 0/1 rollover flag for the active tree
+	// Digest domain separation.
+	ChainId     frontend.Variable `gnark:",public"` // chain id included in request id digest
+	PoolAddress frontend.Variable `gnark:",public"` // pool address included in request id digest
 
-	// Batch sizing.
-	NRequests         frontend.Variable `gnark:",public"` // number of active requests (1..MaxSlots)
-	NTotalCommitments frontend.Variable `gnark:",public"` // number of active commitments (1..MaxSlots)
+	// The shared append relation, including its own NAppends leaf count. NAppends is the
+	// number of commitments this batch writes, so it is the commitment-side activity prefix.
+	NoteAppend
+
+	// Batch sizing that is specific to deposits, because only this circuit fans a single
+	// request out into several commitments.
+	NRequests frontend.Variable `gnark:",public"` // number of active requests (1..MaxSlots)
 
 	// Per-request arrays (active first, then zero padded).
 	DepositRequestIds []frontend.Variable `gnark:",public"` // [MaxSlots] request ids for active requests; zero for inactive
@@ -100,11 +116,12 @@ type DepositEpochPublicInputs struct {
 	CommitmentsOut []frontend.Variable `gnark:",public"` // [MaxSlots] commitments for active slots; zero for inactive
 }
 
+// Exported field spelling is frozen for witness-builder compatibility. New identifiers use Go initialisms.
 type DepositEpochPrivateInputs struct {
 	// Per-request witness (active first, then zero padded).
-	Depositors []frontend.Variable // [MaxSlots] depositor addresses (for request id digest)
-	TokenIDs   []frontend.Variable // [MaxSlots] token id per request (for request id digest)
-	Nonces     []frontend.Variable // [MaxSlots] nonce per request (for request id digest)
+	Depositors     []frontend.Variable // [MaxSlots] depositor addresses (for request id digest)
+	TokenAddresses []frontend.Variable // [MaxSlots] token address per request (for request id digest)
+	Nonces         []frontend.Variable // [MaxSlots] nonce per request (for request id digest)
 
 	// Per-commitment witness (active first, then zero padded).
 	OutputNPKs   []frontend.Variable // [MaxSlots] recipient NPKs for commitments (witness only)
@@ -120,11 +137,8 @@ type DepositEpochPrivateInputs struct {
 // This is not a structure for input witnesses; it groups intermediate variables (selectors and
 // evolving Merkle state) derived while building constraints.
 type depositInternalState struct {
-	currentCount     frontend.Variable   // evolving leaf count for the active output tree
-	currentFrontier  []frontend.Variable // evolving frontier for the active output tree
-	fullTreeRoot     frontend.Variable   // root of the full tree, set by applyBatchAppend; read only when currentCount == 2^depth
-	requestActive    []Bool              // requestActive[r] := (r < NRequests)
-	commitmentActive []Bool              // commitmentActive[i] := (i < NTotalCommitments)
+	noteAppendState        // evolving output-tree state and the commitment-side activity selector
+	requestActive   []Bool // requestActive[r] := (r < NRequests)
 }
 
 // =============================================================================
@@ -145,7 +159,7 @@ func NewDepositEpochCircuit(maxSlots, merkleDepth, maxNoteRootsPerProof int) *De
 			MaxNoteRootsPerProof: maxNoteRootsPerProof,
 		},
 		Pub: DepositEpochPublicInputs{
-			NoteKnownRoots:    make([]frontend.Variable, maxNoteRootsPerProof),
+			NoteAppend:        NoteAppend{NoteKnownRoots: make([]frontend.Variable, maxNoteRootsPerProof)},
 			DepositRequestIds: make([]frontend.Variable, maxSlots),
 			TotalAmounts:      make([]frontend.Variable, maxSlots),
 			CommitmentCounts:  make([]frontend.Variable, maxSlots),
@@ -153,7 +167,7 @@ func NewDepositEpochCircuit(maxSlots, merkleDepth, maxNoteRootsPerProof int) *De
 		},
 		Priv: DepositEpochPrivateInputs{
 			Depositors:      make([]frontend.Variable, maxSlots),
-			TokenIDs:        make([]frontend.Variable, maxSlots),
+			TokenAddresses:  make([]frontend.Variable, maxSlots),
 			Nonces:          make([]frontend.Variable, maxSlots),
 			OutputNPKs:      make([]frontend.Variable, maxSlots),
 			OutputValues:    make([]frontend.Variable, maxSlots),
@@ -175,19 +189,14 @@ func (c *DepositEpochCircuit) Define(api frontend.API) error {
 	// Enforce structural integrity of request sizing.
 	c.assertTotalCommitmentCount(api, state)
 
-	// Range-check all per-recipient output values (prevents overflow in running sums).
-	for i := 0; i < c.Shape.MaxSlots; i++ {
-		AssertIsNBits(api, c.Priv.OutputValues[i], AmountBits)
-	}
-
 	// Process all commitments in a single pass.
 	c.processCommitments(api, &state)
 
 	// Append every active commitment into the output tree in one batch.
-	c.applyBatchAppend(api, &state)
+	c.Pub.applyBatchAppend(api, c.Shape.MerkleDepth, c.Pub.CommitmentsOut, &state.noteAppendState)
 
 	// Bind the final tree state to public outputs.
-	c.assertFinalState(api, state)
+	c.Pub.assertFinalState(api, c.Shape.MerkleDepth, state.noteAppendState)
 
 	return nil
 }
@@ -196,114 +205,73 @@ func (c *DepositEpochCircuit) Define(api frontend.API) error {
 // Validation helpers
 // =============================================================================
 
-// validateInputs performs basic range/bounds checks and builds cached selectors used by later helpers.
+// validateInputs is this circuit's single validation entry point: it bounds every input the
+// circuit later hashes or sums, and returns the selectors the processing helpers consume.
+// The shared append relation validates its own public tree inputs and builds the
+// commitment-side selector; everything added here is deposit-specific.
 func (c *DepositEpochCircuit) validateInputs(api frontend.API) depositInternalState {
-	currentCount, currentFrontier := c.validatePublicInputsAndInitTreeState(api)
+	appendState := c.Pub.validateAndInitTreeState(api, c.Shape.MaxSlots, c.Shape.MerkleDepth, c.Priv.NoteFrontierOld)
 
-	// Cache selectors used throughout the circuit.
-	requestActive := make([]Bool, c.Shape.MaxSlots)
-	commitmentActive := make([]Bool, c.Shape.MaxSlots)
-	for i := 0; i < c.Shape.MaxSlots; i++ {
-		requestActive[i] = isGreaterThanConst(api, c.Pub.NRequests, uint64(i), CountBits)
-		commitmentActive[i] = isGreaterThanConst(api, c.Pub.NTotalCommitments, uint64(i), CountBits)
-	}
-
-	return depositInternalState{
-		currentCount:     currentCount,
-		currentFrontier:  currentFrontier,
-		requestActive:    requestActive,
-		commitmentActive: commitmentActive,
-	}
-}
-
-// validatePublicInputsAndInitTreeState enforces public bounds, rollover semantics, and binds the provided
-// `NoteFrontierOld` witness to the selected active tree root (when not rolling over).
-func (c *DepositEpochCircuit) validatePublicInputsAndInitTreeState(api frontend.API) (currentCount frontend.Variable, currentFrontier []frontend.Variable) {
-	// Range-check and bound-check public tree inputs.
-	AssertIsNBits(api, c.Pub.CountOld, CountBits)
-	AssertIsNBits(api, c.Pub.CountNew, CountBits)
-
-	// 1 <= NRequests <= MaxSlots
+	// 1 <= NRequests <= MaxSlots. NAppends carries the same bound inside the append relation.
 	AssertIsNonZero(api, c.Pub.NRequests)
 	AssertIsLessOrEqual(api, c.Pub.NRequests, uint64(c.Shape.MaxSlots), CountBits)
 
-	// 1 <= NTotalCommitments <= MaxSlots
-	AssertIsNonZero(api, c.Pub.NTotalCommitments)
-	AssertIsLessOrEqual(api, c.Pub.NTotalCommitments, uint64(c.Shape.MaxSlots), CountBits)
+	// Request and commitment slots are allocated to the same capacity, so one pass applies both
+	// sets of checks. The two gates stay separate because a single request can carry several
+	// commitments, which makes the two active prefixes differ.
+	requestActive := make([]Bool, c.Shape.MaxSlots)
+	for i := 0; i < c.Shape.MaxSlots; i++ {
+		requestActive[i] = isGreaterThanConst(api, c.Pub.NRequests, uint64(i), CountBits)
+		requestInactive := Not(api, requestActive[i])
+		commitmentInactive := Not(api, appendState.commitmentActive[i])
 
-	// ActiveNoteTreeNumber is within [0, MaxNoteTreeNumber].
-	AssertIsLess(api, c.Pub.ActiveNoteTreeNumber, uint64(MaxNoteTreeNumber)+1, NoteTreeNumberBits+1)
+		// Request preimages must fit their on-chain address and nonce encodings.
+		AssertIsNBits(api, c.Priv.TokenAddresses[i], AddressBits)
+		AssertIsNonZeroIf(api, requestActive[i], c.Priv.TokenAddresses[i])
+		AssertIsNBits(api, c.Priv.Depositors[i], AddressBits)
+		AssertIsNBits(api, c.Priv.Nonces[i], DepositNonceBits)
 
-	// Tree capacity checks.
-	noteTreeCapacityLeaves := uint64(1) << c.Shape.MerkleDepth
-	AssertIsLessOrEqual(api, c.Pub.CountOld, noteTreeCapacityLeaves, CountBits)
-	AssertIsLessOrEqual(api, c.Pub.CountNew, noteTreeCapacityLeaves, CountBits)
+		// Canonical zero padding for inactive request slots.
+		AssertIsZeroIf(api, requestInactive, c.Pub.DepositRequestIds[i])
+		AssertIsZeroIf(api, requestInactive, c.Pub.TotalAmounts[i])
+		AssertIsZeroIf(api, requestInactive, c.Priv.Depositors[i])
+		AssertIsZeroIf(api, requestInactive, c.Priv.TokenAddresses[i])
+		AssertIsZeroIf(api, requestInactive, c.Priv.Nonces[i])
 
-	// Rollover semantics: non-rollover requires CountOld < capacity; rollover requires CountOld == capacity.
-	rollover := AsBool(c.Pub.Rollover)
-	AssertIsBool(api, rollover)
-	notRollover := Not(api, rollover)
-	AssertIsLessIf(api, notRollover, c.Pub.CountOld, noteTreeCapacityLeaves, CountBits)
-	AssertEqualIfU64(api, rollover, c.Pub.CountOld, noteTreeCapacityLeaves)
+		// Per-recipient output values, range-checked so the running sums cannot overflow.
+		AssertIsNBits(api, c.Priv.OutputValues[i], AmountBits)
 
-	// Bind frontier witness to the selected active tree root when not rolling over.
-	knownTreeNumbers := unpackSlots(
-		api,
-		c.Pub.NoteKnownTreeNumbersPacked,
-		len(c.Pub.NoteKnownRoots),
-		TreeNumberBitsPerSlot,
-	)
-	AssertSingleActiveRootForTreeNumber(
-		api,
-		c.Pub.NoteKnownRoots,
-		knownTreeNumbers,
-		c.Pub.ActiveNoteTreeNumber,
-	)
-	activeTreeRoot := selectByTreeNumber(
-		api,
-		c.Pub.NoteKnownRoots,
-		knownTreeNumbers,
-		c.Pub.ActiveNoteTreeNumber,
-	)
-	rootFromFrontier := computeRootFromFrontier(api, c.Priv.NoteFrontierOld, c.Pub.CountOld, c.Shape.MerkleDepth)
-	AssertEqualIf(api, notRollover, rootFromFrontier, activeTreeRoot)
+		// Canonical zero padding for inactive commitment slots.
+		AssertIsZeroIf(api, commitmentInactive, c.Pub.CommitmentsOut[i])
+		AssertIsZeroIf(api, commitmentInactive, c.Priv.OutputNPKs[i])
+		AssertIsZeroIf(api, commitmentInactive, c.Priv.OutputValues[i])
 
-	// Rollover starts from an empty state; otherwise from the old state. Select keeps append constraints uniform.
-	currentCount = Select(api, rollover, 0, c.Pub.CountOld)
-	currentFrontier = make([]frontend.Variable, c.Shape.MerkleDepth)
-	for i := 0; i < c.Shape.MerkleDepth; i++ {
-		currentFrontier[i] = Select(api, rollover, 0, c.Priv.NoteFrontierOld[i])
+		// Active commitments must carry value, so a zero-value leaf cannot consume tree capacity.
+		AssertIsNonZeroIf(api, appendState.commitmentActive[i], c.Priv.OutputValues[i])
 	}
-	return currentCount, currentFrontier
+
+	return depositInternalState{noteAppendState: appendState, requestActive: requestActive}
 }
 
 // assertTotalCommitmentCount enforces that the request headers are structurally consistent:
 // - active requests have CommitmentCounts[r] >= 1,
 // - inactive requests are zero padded,
-// - sum(CommitmentCounts for active requests) == NTotalCommitments.
+// - sum(CommitmentCounts for active requests) == NAppends.
 func (c *DepositEpochCircuit) assertTotalCommitmentCount(api frontend.API, state depositInternalState) {
 	// CommitmentCounts has active-first semantics. Active requests must have CommitmentCounts[r] >= 1; inactive must be 0.
 	totalCommitmentsFromRequests := frontend.Variable(0)
 	for r := 0; r < c.Shape.MaxSlots; r++ {
 		requestActive := state.requestActive[r]
-		requestInactive := Not(api, requestActive)
 
 		// Active requests must have at least 1 commitment; inactive requests must be 0.
 		AssertIsNBits(api, c.Pub.CommitmentCounts[r], CountBits)
 		AssertIsNonZeroIf(api, requestActive, c.Pub.CommitmentCounts[r])
 		AssertIsZeroIf(api, Not(api, requestActive), c.Pub.CommitmentCounts[r])
 
-		// Zero padding for inactive request slots.
-		AssertIsZeroIf(api, requestInactive, c.Pub.DepositRequestIds[r])
-		AssertIsZeroIf(api, requestInactive, c.Pub.TotalAmounts[r])
-		AssertIsZeroIf(api, requestInactive, c.Priv.Depositors[r])
-		AssertIsZeroIf(api, requestInactive, c.Priv.TokenIDs[r])
-		AssertIsZeroIf(api, requestInactive, c.Priv.Nonces[r])
-
 		// Accumulate the total across active requests only.
 		totalCommitmentsFromRequests = AddIf(api, requestActive, totalCommitmentsFromRequests, c.Pub.CommitmentCounts[r])
 	}
-	AssertEqual(api, totalCommitmentsFromRequests, c.Pub.NTotalCommitments)
+	AssertEqual(api, totalCommitmentsFromRequests, c.Pub.NAppends)
 }
 
 // =============================================================================
@@ -321,26 +289,18 @@ func (c *DepositEpochCircuit) processCommitments(api frontend.API, state *deposi
 
 	for i := 0; i < c.Shape.MaxSlots; i++ {
 		commitmentActive := state.commitmentActive[i]
-		commitmentInactive := Not(api, commitmentActive)
-
-		// Zero padding for inactive commitment slots.
-		AssertIsZeroIf(api, commitmentInactive, c.Pub.CommitmentsOut[i])
-		AssertIsZeroIf(api, commitmentInactive, c.Priv.OutputNPKs[i])
-		AssertIsZeroIf(api, commitmentInactive, c.Priv.OutputValues[i])
-
-		// Enforce positive values for active commitments (prevents zero-value leaves consuming tree capacity).
-		AssertIsNonZeroIf(api, commitmentActive, c.Priv.OutputValues[i])
 
 		// A deposit key is chosen by the depositor and never derived in-circuit, so an unchecked
 		// slot could mint a note that no spend relation will ever open. Inactive slots are already
-		// pinned to zero above, which is inside the reserved range, so the gate is required here.
+		// pinned to zero by validateInputs, which is inside the reserved range, so the gate
+		// is required here.
 		AssertSpendableNPKIf(api, commitmentActive, c.Priv.OutputNPKs[i])
 
-		// TokenID is per-request, so we look it up by the requestIndex.
-		tokenId := SelectByIndex(api, c.Priv.TokenIDs, requestIndex)
+		// TokenAddress is per-request, so we look it up by the requestIndex.
+		tokenAddress := SelectByIndex(api, c.Priv.TokenAddresses, requestIndex)
 
 		// Compute and bind the commitment for this slot (gated by commitmentActive).
-		expectedCommitment := Poseidon2T4(api, domainNote, c.Priv.OutputNPKs[i], tokenId, c.Priv.OutputValues[i])
+		expectedCommitment := Poseidon2T4(api, domainNoteCommitmentV2, c.Priv.OutputNPKs[i], tokenAddress, c.Priv.OutputValues[i])
 		AssertEqualIf(api, commitmentActive, expectedCommitment, c.Pub.CommitmentsOut[i])
 		AssertIsNonZeroIf(api, commitmentActive, c.Pub.CommitmentsOut[i])
 
@@ -366,14 +326,16 @@ func (c *DepositEpochCircuit) processCommitments(api frontend.API, state *deposi
 		expectedRequestId := SelectByIndex(api, c.Pub.DepositRequestIds, requestIndex)
 		depositor := SelectByIndex(api, c.Priv.Depositors, requestIndex)
 		nonce := SelectByIndex(api, c.Priv.Nonces, requestIndex)
-		// computedRequestId = Hash(domainDepositRequest, ChainId, PoolAddress, Depositor, TokenID, ExpectedTotal, Nonce, RequestCommitmentsHash)
+
+		// computedRequestId = Hash(domainDepositRequestV2, ChainId, PoolAddress,
+		// Depositor, TokenAddress, ExpectedTotal, Nonce, RequestCommitmentsHash)
 		computedRequestId := Poseidon2T4(
 			api,
-			domainDepositRequest,
+			domainDepositRequestV2,
 			c.Pub.ChainId,
 			c.Pub.PoolAddress,
 			depositor,
-			tokenId,
+			tokenAddress,
 			expectedTotal,
 			nonce,
 			requestCommitmentsHash,
@@ -390,42 +352,4 @@ func (c *DepositEpochCircuit) processCommitments(api frontend.API, state *deposi
 
 	// All requests must be finalized by the end.
 	AssertEqual(api, requestIndex, c.Pub.NRequests)
-}
-
-// applyBatchAppend appends every active commitment into the output tree in one batch.
-//
-// commitmentActive[i] := (i < NTotalCommitments), so the live commitments already occupy a
-// prefix of the slot array and no routing is needed — a single packed block goes straight
-// into the batched append. That costs ~MaxSlots + MerkleDepth Poseidon permutations where
-// appending one leaf at a time cost ~MaxSlots * MerkleDepth.
-func (c *DepositEpochCircuit) applyBatchAppend(api frontend.API, state *depositInternalState) {
-	batch := newPrefixPackedList(api, c.Pub.CommitmentsOut, state.commitmentActive)
-
-	// currentCount is < 2^MerkleDepth here: rollover forces it to 0, and without rollover
-	// validatePublicInputsAndInitTreeState already required CountOld < 2^MerkleDepth.
-	// appendFrontierBatch re-checks that, plus that the batch fits in the remaining capacity.
-	nextFrontier, nextCount, finalCarry := appendFrontierBatch(
-		api,
-		state.currentFrontier,
-		state.currentCount,
-		batch,
-		c.Shape.MerkleDepth,
-	)
-	state.currentFrontier = nextFrontier
-	state.currentCount = nextCount
-	state.fullTreeRoot = finalCarry
-}
-
-// assertFinalState binds the internal working tree state to public outputs.
-func (c *DepositEpochCircuit) assertFinalState(api frontend.API, state depositInternalState) {
-	// When tree is full, computeRootFromFrontier returns incorrect result (handled internally),
-	// so we use fullTreeRoot from the batch append's final carry instead.
-	maxCount := uint64(1) << c.Shape.MerkleDepth
-	isFull := IsEqual(api, state.currentCount, maxCount)
-
-	computedRoot := computeRootFromFrontier(api, state.currentFrontier, state.currentCount, c.Shape.MerkleDepth)
-	rootNew := api.Select(isFull.AsField(), state.fullTreeRoot, computedRoot)
-
-	AssertEqual(api, rootNew, c.Pub.RootNew)
-	AssertEqual(api, state.currentCount, c.Pub.CountNew)
 }

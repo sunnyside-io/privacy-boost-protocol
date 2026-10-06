@@ -12,6 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Sunnyside Labs Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package frontend
 
 import (
@@ -31,18 +45,18 @@ import (
 // What this circuit enforces (high level, per active claim slot):
 //   - **Gift binding**: both branches re-derive
 //     giftNPK = Poseidon(domainGiftBind, recipientSlot, Poseidon(domainGiftBind, blind, refundField))
-//     and assert C_gift = Poseidon(domainNote, giftNPK, tokenId, amount) — so a malformed gift can
+//     and assert C_gift = Poseidon(domainNoteCommitmentV2, giftNPK, tokenAddress, amount) — so a malformed gift can
 //     be neither claimed nor refunded inconsistently.
 //   - **Membership**: C_gift exists in the funding note tree (Merkle membership against a selected
 //     historical/current root, tree-number-bound like a normal note spend).
-//   - **Nullifier**: GiftNullifier = Poseidon(domainGiftNull + fundingTreeNumber*256, giftNPK,
+//   - **Nullifier**: GiftNullifier = Poseidon(domainGiftNullifierV2 + fundingTreeNumber*256, giftNPK,
 //     giftLeafIndex) is bound to the public NullifiersOut[c].
-//   - **Value conservation**: the single gift input equals the single mint output in both token id
+//   - **Value conservation**: the single gift input equals the single mint output in both token address
 //     and amount (no fee, no value creation).
 //   - **Branch authority**:
 //       * Recipient claim (BranchType=0): a shared accountId_R witness binds wallet ownership
 //         (accountId_R = Poseidon(domainAccountId, recipientSlot, salt_R)), an admissible auth-leaf membership proof,
-//         an EdDSA signature over the PB:GIFT_CLAIM:v2 digest, and the mint target
+//         an EdDSA signature over the PB:GIFT_CLAIM:v3 digest, and the mint target
 //         MPK_target = Poseidon(domainMPK, accountId_R, nk_R) — so only the wallet owner can claim,
 //         and only to themselves.
 //       * Sender refund (BranchType=1): opens {recipientSlot, blind, refundField}, proves
@@ -96,6 +110,7 @@ type GiftClaimShape struct {
 	SenderAuthDepth      int // depth of auth registry trees (recipient claim membership proof)
 }
 
+// Exported field spelling is frozen for witness-builder compatibility. New identifiers use Go initialisms.
 type GiftClaimPublicInputs struct {
 	// Funding note-tree roots (multi-tree input support; the gift may live in a finalized tree).
 	NoteKnownRoots             []frontend.Variable `gnark:",public"` // [MaxNoteRootsPerProof] historical/current note commitment tree roots
@@ -121,30 +136,31 @@ type GiftClaimPublicInputs struct {
 	ProvingTimestamp frontend.Variable `gnark:",public"` // recent UNIX timestamp bounded by the contract
 
 	// Per-claim outputs.
-	NullifiersOut   []frontend.Variable `gnark:",public"` // [MaxGiftClaims] gift nullifiers for active claims; zero padded
-	CommitmentsOut  []frontend.Variable `gnark:",public"` // [MaxGiftClaims] mint commitment in private mode; exact authorization leaf in public mode
-	OutputTokenIds  []frontend.Variable `gnark:",public"` // [MaxGiftClaims] gift token id in public-exit mode; zero in private-mint mode and inactive slots
-	OutputAmounts   []frontend.Variable `gnark:",public"` // [MaxGiftClaims] gift amount in public-exit mode; zero in private-mint mode and inactive slots
-	ClaimDigestHi   []frontend.Variable `gnark:",public"` // [MaxGiftClaims] PB:GIFT_CLAIM:v2 digest, high half
-	ClaimDigestLo   []frontend.Variable `gnark:",public"` // [MaxGiftClaims] PB:GIFT_CLAIM:v2 digest, low half
-	BranchSelectors []frontend.Variable `gnark:",public"` // [MaxGiftClaims] mint mode: 1 = private mint (append output), 0 = public payout (no append)
+	NullifiersOut        []frontend.Variable `gnark:",public"` // [MaxGiftClaims] gift nullifiers for active claims; zero padded
+	CommitmentsOut       []frontend.Variable `gnark:",public"` // [MaxGiftClaims] mint commitment in private mode; exact authorization leaf in public mode
+	OutputTokenAddresses []frontend.Variable `gnark:",public"` // [MaxGiftClaims] gift token address in public-exit mode; zero in private-mint mode and inactive slots
+	OutputAmounts        []frontend.Variable `gnark:",public"` // [MaxGiftClaims] gift amount in public-exit mode; zero in private-mint mode and inactive slots
+	ClaimDigestHi        []frontend.Variable `gnark:",public"` // [MaxGiftClaims] PB:GIFT_CLAIM:v3 digest, high half
+	ClaimDigestLo        []frontend.Variable `gnark:",public"` // [MaxGiftClaims] PB:GIFT_CLAIM:v3 digest, low half
+	BranchSelectors      []frontend.Variable `gnark:",public"` // [MaxGiftClaims] mint mode: 1 = private mint (append output), 0 = public payout (no append)
 }
 
+// Exported field spelling is frozen for witness-builder compatibility. New identifiers use Go initialisms.
 type GiftClaimPrivateInputs struct {
 	// Per-claim branch selector and opened gift material.
 	BranchType       []frontend.Variable // [MaxGiftClaims] 0 = recipient claim, 1 = sender refund (witness only)
 	CGift            []frontend.Variable // [MaxGiftClaims] gift commitment (re-derived and matched in-circuit)
 	GiftNPK          []frontend.Variable // [MaxGiftClaims] gift note public key (re-derived and matched in-circuit)
-	TokenId          []frontend.Variable // [MaxGiftClaims] gift token id (bound by C_gift, equal to output)
+	TokenAddress     []frontend.Variable // [MaxGiftClaims] gift token address (bound by C_gift, equal to output)
 	Amount           []frontend.Variable // [MaxGiftClaims] gift amount (bound by C_gift, equal to output)
 	RecipientSlot    []frontend.Variable // [MaxGiftClaims] wallet address or secret commitment, depending on claim mode
 	Blind            []frontend.Variable // [MaxGiftClaims] fresh per-gift hiding blind
 	RefundField      []frontend.Variable // [MaxGiftClaims] Poseidon(domainGiftRefund, senderMPK, refundAfterBlock)
 	RefundAfterBlock []frontend.Variable // [MaxGiftClaims] sender-chosen refund deadline
 
-	// Secret-bearer claim mode (off-by-default, audit-gated). On an active recipient claim, SecretMode=1 selects a
-	// secret-bearer claim: the gift's recipient slot commits to ClaimSecret (recipientSlot = Poseidon(domainGiftSecret,
-	// ClaimSecret)) instead of a wallet address, so knowledge of ClaimSecret authorizes the claim with
+	// Secret-bearer claim mode. On an active recipient claim, SecretMode=1 selects a
+	// secret-bearer claim: the gift's recipient slot commits to ClaimSecret (recipientSlot = low160(Poseidon(domainGiftSecret,
+	// ClaimSecret))) instead of a wallet address, so knowledge of ClaimSecret authorizes the claim with
 	// no auth key or EdDSA. Secret-bearer claims are forced to public payout, where the claimant chooses
 	// the external destination. SecretMode=0 is the wallet-bound recipient claim. SecretMode is forced
 	// to zero on refund and inactive slots.
@@ -216,21 +232,21 @@ func NewGiftClaimCircuit(maxGiftClaims, noteDepth, maxNoteRootsPerProof, maxAuth
 			SenderAuthDepth:      senderAuthDepth,
 		},
 		Pub: GiftClaimPublicInputs{
-			NoteKnownRoots:  make([]frontend.Variable, maxNoteRootsPerProof),
-			AuthKnownRoots:  make([]frontend.Variable, maxAuthRootsPerProof),
-			NullifiersOut:   make([]frontend.Variable, maxGiftClaims),
-			CommitmentsOut:  make([]frontend.Variable, maxGiftClaims),
-			OutputTokenIds:  make([]frontend.Variable, maxGiftClaims),
-			OutputAmounts:   make([]frontend.Variable, maxGiftClaims),
-			ClaimDigestHi:   make([]frontend.Variable, maxGiftClaims),
-			ClaimDigestLo:   make([]frontend.Variable, maxGiftClaims),
-			BranchSelectors: make([]frontend.Variable, maxGiftClaims),
+			NoteKnownRoots:       make([]frontend.Variable, maxNoteRootsPerProof),
+			AuthKnownRoots:       make([]frontend.Variable, maxAuthRootsPerProof),
+			NullifiersOut:        make([]frontend.Variable, maxGiftClaims),
+			CommitmentsOut:       make([]frontend.Variable, maxGiftClaims),
+			OutputTokenAddresses: make([]frontend.Variable, maxGiftClaims),
+			OutputAmounts:        make([]frontend.Variable, maxGiftClaims),
+			ClaimDigestHi:        make([]frontend.Variable, maxGiftClaims),
+			ClaimDigestLo:        make([]frontend.Variable, maxGiftClaims),
+			BranchSelectors:      make([]frontend.Variable, maxGiftClaims),
 		},
 		Priv: GiftClaimPrivateInputs{
 			BranchType:          make([]frontend.Variable, maxGiftClaims),
 			CGift:               make([]frontend.Variable, maxGiftClaims),
 			GiftNPK:             make([]frontend.Variable, maxGiftClaims),
-			TokenId:             make([]frontend.Variable, maxGiftClaims),
+			TokenAddress:        make([]frontend.Variable, maxGiftClaims),
 			Amount:              make([]frontend.Variable, maxGiftClaims),
 			RecipientSlot:       make([]frontend.Variable, maxGiftClaims),
 			Blind:               make([]frontend.Variable, maxGiftClaims),
@@ -328,7 +344,7 @@ func (c *GiftClaimCircuit) validateInputs(api frontend.API) giftClaimInternalSta
 	// The active output tree's frontier is supplied as a private witness (NoteFrontierOld) and bound to
 	// the public ActiveNoteTreeRoot when not rolling over; in private-mint mode we append onto it. This
 	// mirrors the epoch circuit so gift claims can mint into a NON-empty active tree (CountOld > 0), not
-	// just an empty one. Inactive (public-payout) claims do not append, so the evolving state is reused.
+	// just an empty one. Active public-payout claims do not append; only private-mint claims do.
 	currentFrontier := make([]frontend.Variable, c.Shape.NoteDepth)
 	frontierRoot := computeRootFromFrontier(api, c.Priv.NoteFrontierOld, c.Pub.CountOld, c.Shape.NoteDepth)
 	AssertEqualIf(api, notRollover, frontierRoot, c.Pub.ActiveNoteTreeRoot)
@@ -364,7 +380,7 @@ func (c *GiftClaimCircuit) processClaim(api frontend.API, state *giftClaimIntern
 	// Zero padding for inactive claim slots (binds NClaims between circuit and contract).
 	AssertIsZeroIf(api, claimInactive, c.Pub.NullifiersOut[c0])
 	AssertIsZeroIf(api, claimInactive, c.Pub.CommitmentsOut[c0])
-	AssertIsZeroIf(api, claimInactive, c.Pub.OutputTokenIds[c0])
+	AssertIsZeroIf(api, claimInactive, c.Pub.OutputTokenAddresses[c0])
 	AssertIsZeroIf(api, claimInactive, c.Pub.OutputAmounts[c0])
 	// Inactive (padded) slots must also carry a zero digest, like the per-slot outputs above. The
 	// recipient EdDSA check that binds ClaimDigestHi/Lo is gated off on inactive slots, so without
@@ -376,7 +392,11 @@ func (c *GiftClaimCircuit) processClaim(api frontend.API, state *giftClaimIntern
 
 	// Range checks for active slots.
 	AssertIsNBits(api, c.Priv.Amount[c0], AmountBits)
-	AssertIsNBits(api, c.Priv.TokenId[c0], TokenIDBits)
+	AssertIsNBits(api, c.Priv.TokenAddress[c0], AddressBits)
+
+	AssertIsNonZeroIf(api, claimActive, c.Priv.TokenAddress[c0])
+	AssertIsZeroIf(api, claimInactive, c.Priv.TokenAddress[c0])
+
 	AssertIsLessIf(api, claimActive, c.Priv.FundingTreeNumber[c0], uint64(MaxNoteTreeNumber)+1, NoteTreeNumberBits+1)
 
 	// BranchType must be boolean (0 = recipient claim, 1 = sender refund).
@@ -385,7 +405,7 @@ func (c *GiftClaimCircuit) processClaim(api frontend.API, state *giftClaimIntern
 	recipientBranch := And(api, claimActive, Not(api, branchType))
 	refundBranch := And(api, claimActive, branchType)
 
-	// Secret-bearer claim sub-mode (off-by-default, audit-gated): split an active recipient claim into the wallet-bound
+	// Secret-bearer claim sub-mode: split an active recipient claim into the wallet-bound
 	// path (eoaClaim) and the secret-bearer path (secretClaim). SecretMode is meaningful only on an
 	// active recipient claim, so it is forced to zero on refund and inactive slots (Not(recipientBranch)).
 	secretMode := AsBool(c.Priv.SecretMode[c0])
@@ -410,21 +430,18 @@ func (c *GiftClaimCircuit) processClaim(api frontend.API, state *giftClaimIntern
 	inner := Poseidon2T4(api, domainGiftBind, c.Priv.Blind[c0], c.Priv.RefundField[c0])
 	giftNPK := Poseidon2T4(api, domainGiftBind, c.Priv.RecipientSlot[c0], inner)
 	AssertEqualIf(api, claimActive, giftNPK, c.Priv.GiftNPK[c0])
-	// C_gift below is a note-domain leaf proved against the shared note tree, and that tree still
-	// holds the withdrawal markers appended before the marker-free cutover. A marker has the same
-	// Poseidon(domainNote, key, tokenId, amount) shape with an address in the key position, so the
-	// gift relation is a third path to one. giftNPK is itself a Poseidon output, so that path costs
-	// a preimage search: this closes it structurally rather than pricing it, the same way the epoch
-	// and forced spend relations do.
+	// Native gift spends accept native roots only; legacy gifts first pass through
+	// NoteMigration. Keep the same NPK/address separation as epoch and forced spends:
+	// an address-shaped public payout marker must never be opened as a gift note.
 	//
-	// Gated on claimActive rather than recipientBranch, so it binds the sender refund at :386 too.
+	// Gated on claimActive rather than recipientBranch, so it binds sender refunds too.
 	// A gift whose key landed in the reserved range would be neither claimable nor refundable, which
 	// is the right trade at a rate near 2^-94 and the reason the range is refused rather than
 	// remapped.
 	AssertSpendableNPKIf(api, claimActive, giftNPK)
 
-	// C_gift = Poseidon(domainNote, giftNPK, tokenId, amount)
-	cGift := Poseidon2T4(api, domainNote, giftNPK, c.Priv.TokenId[c0], c.Priv.Amount[c0])
+	// C_gift = Poseidon(domainNoteCommitmentV2, giftNPK, tokenAddress, amount)
+	cGift := Poseidon2T4(api, domainNoteCommitmentV2, giftNPK, c.Priv.TokenAddress[c0], c.Priv.Amount[c0])
 	AssertEqualIf(api, claimActive, cGift, c.Priv.CGift[c0])
 
 	// --- Funding-tree membership: C_gift exists in the selected funding tree (tree-number-bound). ---
@@ -432,8 +449,8 @@ func (c *GiftClaimCircuit) processClaim(api frontend.API, state *giftClaimIntern
 	AssertRootWithTreeNumberIf(api, claimActive, fundingRoot, c.Priv.FundingTreeNumber[c0], c.Pub.NoteKnownRoots, c.Pub.NoteKnownTreeNumbersPacked)
 
 	// --- Gift nullifier: tree-number-bound, shared by claim and refund. ---
-	// combinedDomain = domainGiftNull + fundingTreeNumber * NullifierTreeNumberMultiplier
-	combinedDomain := api.Add(domainGiftNull, api.Mul(c.Priv.FundingTreeNumber[c0], NullifierTreeNumberMultiplier))
+	// combinedDomain = domainGiftNullifierV2 + fundingTreeNumber * NullifierTreeNumberMultiplier
+	combinedDomain := api.Add(domainGiftNullifierV2, api.Mul(c.Priv.FundingTreeNumber[c0], NullifierTreeNumberMultiplier))
 	giftNullifier := Poseidon2T4(api, combinedDomain, giftNPK, c.Priv.GiftLeafIndex[c0])
 	AssertEqualIf(api, claimActive, giftNullifier, c.Pub.NullifiersOut[c0])
 	AssertIsNonZeroIf(api, claimActive, c.Pub.NullifiersOut[c0])
@@ -487,7 +504,7 @@ func (c *GiftClaimCircuit) processClaim(api frontend.API, state *giftClaimIntern
 	VerifyEdDSAIf(api, signatureEnabled, authPk, authSig, claimMsg)
 
 	// --- Value conservation + per-mode token/amount privacy. ---
-	// Token and amount are PRIVATE witnesses. They bind to the public OutputTokenIds/OutputAmounts only
+	// Token and amount are PRIVATE witnesses. They bind to the public OutputTokenAddresses/OutputAmounts only
 	// in public-payout (exit) mode, where the on-chain withdrawal must reveal them to pay the ERC-20.
 	// In private-mint mode (wallet recipient claim / sender refund) the public columns are forced to zero, so a
 	// private claim never exposes the gifted value on chain; the output commitment below binds the real
@@ -504,9 +521,9 @@ func (c *GiftClaimCircuit) processClaim(api frontend.API, state *giftClaimIntern
 	AssertEqualIf(api, publicEOAClaim, c.Pub.CommitmentsOut[c0], directKeyLeaf)
 	AssertEqualIf(api, publicRefund, c.Pub.CommitmentsOut[c0], refundAuthLeaf)
 	AssertIsZeroIf(api, publicSecretClaim, c.Pub.CommitmentsOut[c0])
-	AssertIsZeroIf(api, mintActive, c.Pub.OutputTokenIds[c0])
+	AssertIsZeroIf(api, mintActive, c.Pub.OutputTokenAddresses[c0])
 	AssertIsZeroIf(api, mintActive, c.Pub.OutputAmounts[c0])
-	AssertEqualIf(api, payoutActive, c.Pub.OutputTokenIds[c0], c.Priv.TokenId[c0])
+	AssertEqualIf(api, payoutActive, c.Pub.OutputTokenAddresses[c0], c.Priv.TokenAddress[c0])
 	AssertEqualIf(api, payoutActive, c.Pub.OutputAmounts[c0], c.Priv.Amount[c0])
 
 	// --- Mint output commitment and append in private-mint mode. ---
@@ -521,7 +538,7 @@ func (c *GiftClaimCircuit) processClaim(api frontend.API, state *giftClaimIntern
 // One shared accountId_R witness spans wallet binding, auth membership, and target-MPK derivation,
 // so the claim can mint only to the account that controls the funded wallet address.
 //
-// The EdDSA signature over the PB:GIFT_CLAIM:v2 digest lives in processClaim, which gates one shared
+// The EdDSA signature over the PB:GIFT_CLAIM:v3 digest lives in processClaim, which gates one shared
 // verification on this branch plus the direct-key refund branch.
 func (c *GiftClaimCircuit) assertRecipientBranch(api frontend.API, enabled Bool, c0 int) frontend.Variable {
 	// accountId_R = Poseidon(domainAccountId, recipientSlot, salt_R) — wallet ownership binding.
@@ -658,15 +675,15 @@ func (c *GiftClaimCircuit) assertAuthorizationMembership(api frontend.API, enabl
 func (c *GiftClaimCircuit) assertAndAppendMint(api frontend.API, state *giftClaimInternalState, claimActive, mintMode Bool, c0 int) {
 	// The minted note's NPK: a wallet recipient mints to TargetMPK, while a sender refund mints back to senderMPK.
 	// Both are carried by the witness; the active branch's binding above pins the correct one.
-	// outputNPK = Poseidon(domainNote, mintMPK, outputNoteRnd).
+	// outputNPK = Poseidon(domainNotePublicKey, mintMPK, outputNoteRnd).
 	branchType := AsBool(c.Priv.BranchType[c0])
 	senderMPK := Poseidon2T4(api, domainMPK, c.Priv.SenderAccountId[c0], c.Priv.SenderNk[c0])
 	mintMPK := Select(api, branchType, senderMPK, c.Priv.TargetMPK[c0])
 
-	outputNPK := Poseidon2T4(api, domainNote, mintMPK, c.Priv.OutputNoteRnd[c0])
+	outputNPK := Poseidon2T4(api, domainNotePublicKey, mintMPK, c.Priv.OutputNoteRnd[c0])
 	// Bind the output commitment to the PRIVATE token/amount, not the public columns (which are zero in
 	// mint mode): the commitment hides the gifted value behind its Poseidon hash on the private path.
-	outputCommitment := Poseidon2T4(api, domainNote, outputNPK, c.Priv.TokenId[c0], c.Priv.Amount[c0])
+	outputCommitment := Poseidon2T4(api, domainNoteCommitmentV2, outputNPK, c.Priv.TokenAddress[c0], c.Priv.Amount[c0])
 
 	// Append into the active output tree only in private-mint mode for active claims.
 	appendEnabled := And(api, claimActive, mintMode)

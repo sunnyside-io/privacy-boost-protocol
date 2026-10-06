@@ -12,6 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Sunnyside Labs Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package frontend
 
 import (
@@ -29,8 +43,14 @@ import (
 //     the resulting auth leaf equals the live leaf supplied by the pool as a public input.
 //   - **Spend**: each active input note exists in a selected historical commitment tree (Merkle
 //     membership proof), matches a public `InputCommitments[i]`, and produces a public nullifier.
-//   - **Withdrawal binding**: the withdrawal token id matches the transfer token id, and the withdrawal
+//   - **Withdrawal binding**: every input commits to the proof's selected asset, and the withdrawal
 //     amount equals the sum of active input values.
+//
+// Note formats:
+//   - One request proves ONE note format. `Pub.LegacyTokenId` selects it for the whole proof: zero opens
+//     native address notes, and a nonzero legacy registry id opens pre-migration notes. The selector drives
+//     the commitment domain, the commitment's asset preimage, and the nullifier domain together, so a single
+//     proof can never mix the two relations across its inputs while the payout stays one ERC-20 amount.
 //
 // Multi-tree support:
 // - `Pub.NoteKnownRoots` provides roots of historical commitment trees (size `Shape.MaxNoteRootsPerProof`).
@@ -44,6 +64,9 @@ import (
 //     PrivacyBoost reads that exact AuthRegistry leaf once, when accepting the request.
 //   - It does not prove uniqueness of nullifiers; uniqueness is enforced on-chain.
 //   - It does not prove that NoteKnownRoots correspond to contract history; the contract verifies that.
+//     It also does not prove which side of the activation boundary a tree sits on. The pool admits only
+//     roots from the selected format's side, and every input is bound to a tree present in that public
+//     root table, so the contract's root policy is what keeps one proof inside one note format.
 //
 // Witness author notes:
 // - Arrays are fixed-size. Only the first `NIn` entries are active; all others MUST be zero.
@@ -67,6 +90,7 @@ type ForcedWithdrawShape struct {
 	MaxNoteRootsPerProof int // number of note roots provided in a proof
 }
 
+// Exported field spelling is frozen for witness-builder compatibility. New identifiers use Go initialisms.
 type ForcedWithdrawPublicInputs struct {
 	// Note tree roots (multi-tree input support).
 	NoteKnownRoots             []frontend.Variable `gnark:",public"` // [MaxNoteRootsPerProof] historical note commitment tree roots
@@ -80,18 +104,24 @@ type ForcedWithdrawPublicInputs struct {
 	ApproveDigestHi frontend.Variable `gnark:",public"` // approval digest part (high)
 	ApproveDigestLo frontend.Variable `gnark:",public"` // approval digest part (low)
 
-	WithdrawalTo      frontend.Variable `gnark:",public"` // withdrawal recipient (contract-defined encoding)
-	WithdrawalTokenID frontend.Variable `gnark:",public"` // token id of the withdrawal
-	WithdrawalAmount  frontend.Variable `gnark:",public"` // gross amount (total input value; fee deducted by contract)
-	AuthLeaf          frontend.Variable `gnark:",public"` // live AuthRegistry leaf read by PrivacyBoost
-	AuthContext       frontend.Variable `gnark:",public"` // packed expiry/mode/leaf-index/tree/version context
+	WithdrawalTo           frontend.Variable `gnark:",public"` // withdrawal recipient (contract-defined encoding)
+	WithdrawalTokenAddress frontend.Variable `gnark:",public"` // nonzero ERC-20 address encoded as uint160
+	WithdrawalAmount       frontend.Variable `gnark:",public"` // gross amount (total input value; fee deducted by contract)
+	AuthLeaf               frontend.Variable `gnark:",public"` // live AuthRegistry leaf read by PrivacyBoost
+	AuthContext            frontend.Variable `gnark:",public"` // packed expiry/mode/leaf-index/tree/version context
+
+	// LegacyTokenId selects the note format for the whole request. Zero opens native address notes, and a
+	// nonzero value is the legacy registry id the pre-migration commitments were built under. The pool
+	// resolves a nonzero id through the sealed asset snapshot and requires it to name WithdrawalTokenAddress,
+	// which is why the circuit can bind the id alone and never needs the snapshot membership proof.
+	LegacyTokenId frontend.Variable `gnark:",public"` // legacy registry id, or zero for a native note
 }
 
+// Exported field spelling is frozen for witness-builder compatibility. New identifiers use Go initialisms.
 type ForcedWithdrawPrivateInputs struct {
 	InputNoteTreeNumber []frontend.Variable // [MaxInputs] which note tree each input spends from (15-bit global id)
 
-	TransferTokenID frontend.Variable // token id expected for all inputs
-	NullifyingKey   frontend.Variable // secret; used for MPK and nullifier derivation
+	NullifyingKey frontend.Variable // secret; used for MPK and nullifier derivation
 
 	AuthPkX    frontend.Variable // auth pubkey X
 	AuthPkY    frontend.Variable // auth pubkey Y
@@ -100,7 +130,6 @@ type ForcedWithdrawPrivateInputs struct {
 	AuthSigS   frontend.Variable // signature scalar S
 	Blinding   frontend.Variable // Safe approval commitment blinding
 
-	InputTokenID       []frontend.Variable   // [MaxInputs] token id for each input note
 	InputValue         []frontend.Variable   // [MaxInputs] value for each input note
 	InputNoteRnd       []frontend.Variable   // [MaxInputs] randomness used for input NPK
 	InputNoteLeafIndex []frontend.Variable   // [MaxInputs] leaf index in the selected input tree
@@ -108,7 +137,8 @@ type ForcedWithdrawPrivateInputs struct {
 }
 
 type forcedWithdrawInternalState struct {
-	inputActive []Bool // inputActive[i] := (i < Pub.NIn)
+	inputActive  []Bool // inputActive[i] := (i < Pub.NIn)
+	legacyFormat Bool   // legacyFormat := (Pub.LegacyTokenId != 0), one selector for every input
 }
 
 // =============================================================================
@@ -121,7 +151,10 @@ type forcedWithdrawInternalState struct {
 //   - These sizing parameters define the circuit shape at compile time.
 //   - They do not add constraints by themselves, but they determine how many constraints exist once
 //     `Define` is executed (more inputs/depth => larger circuit).
-func NewForcedWithdrawCircuit(maxInputs, merkleDepth, _ int, maxNoteRootsPerProof, _ int) *ForcedWithdrawCircuit {
+//
+// The third and fifth arguments are retained for caller compatibility with the historical
+// auth-root shape. This circuit authenticates the request digest and does not allocate auth roots.
+func NewForcedWithdrawCircuit(maxInputs, merkleDepth, legacyAuthDepth int, maxNoteRootsPerProof, legacyMaxAuthRoots int) *ForcedWithdrawCircuit {
 	c := &ForcedWithdrawCircuit{
 		Shape: ForcedWithdrawShape{
 			MaxInputs:            maxInputs,
@@ -135,7 +168,6 @@ func NewForcedWithdrawCircuit(maxInputs, merkleDepth, _ int, maxNoteRootsPerProo
 		},
 		Priv: ForcedWithdrawPrivateInputs{
 			InputNoteTreeNumber: make([]frontend.Variable, maxInputs),
-			InputTokenID:        make([]frontend.Variable, maxInputs),
 			InputValue:          make([]frontend.Variable, maxInputs),
 			InputNoteRnd:        make([]frontend.Variable, maxInputs),
 			InputNoteLeafIndex:  make([]frontend.Variable, maxInputs),
@@ -163,8 +195,12 @@ func (c *ForcedWithdrawCircuit) Define(api frontend.API) error {
 	// Process each input note.
 	inputValueSum := c.processInputs(api, state)
 
-	// Bind public withdrawal outputs.
-	c.assertFinalState(api, inputValueSum)
+	// Bind the spent value to the public withdrawal amount. The asset needs no separate bind: every input
+	// commitment already hashes the selected asset field, so a mismatched asset cannot open a membership
+	// proof, and for a legacy request the pool resolves the registry id through the sealed snapshot and
+	// requires it to equal the payout token.
+	AssertEqual(api, c.Pub.WithdrawalAmount, inputValueSum)
+
 	return nil
 }
 
@@ -176,7 +212,13 @@ func (c *ForcedWithdrawCircuit) validateInputs(api frontend.API) forcedWithdrawI
 	// Basic range checks for public inputs.
 	AssertIsNBits(api, c.Pub.NIn, CountBits)
 	AssertIsNBits(api, c.Pub.WithdrawalAmount, AmountBits)
-	AssertIsNBits(api, c.Pub.WithdrawalTokenID, TokenIDBits)
+	AssertIsNBits(api, c.Pub.WithdrawalTokenAddress, AddressBits)
+	// Every active input must fund the same nonzero ERC-20 payout asset.
+	AssertIsNonZero(api, c.Pub.WithdrawalTokenAddress)
+	// The note format is one public field for the whole proof. Its width matches the uint16 registry id the
+	// sealed snapshot is keyed by, and that snapshot reserves id zero as its empty leaf, so zero encodes
+	// "native note" without colliding with any resolvable legacy asset.
+	AssertIsNBits(api, c.Pub.LegacyTokenId, TokenIDBits)
 	// WithdrawalTo arrives as the pool's uint256(uint160(withdrawal.to)) encoding, so this range
 	// check is redundant for the on-chain caller and exists for callers that build the public
 	// vector themselves. The recipient's real binding is the approval digest, which the pool
@@ -188,12 +230,30 @@ func (c *ForcedWithdrawCircuit) validateInputs(api frontend.API) forcedWithdrawI
 	AssertIsNonZero(api, c.Pub.NIn)
 	AssertIsLessOrEqual(api, c.Pub.NIn, uint64(c.Shape.MaxInputs), CountBits)
 
-	// Cache inputActive selectors.
+	// Cache inputActive selectors and bound every per-input witness the processing loop consumes.
 	inputActive := make([]Bool, c.Shape.MaxInputs)
 	for i := 0; i < c.Shape.MaxInputs; i++ {
 		inputActive[i] = isGreaterThanConst(api, c.Pub.NIn, uint64(i), CountBits)
+		inputInactive := Not(api, inputActive[i])
+
+		// Range-check the spent value so the accumulated sum cannot overflow.
+		AssertIsNBits(api, c.Priv.InputValue[i], AmountBits)
+
+		// Bounds check for input note tree number (defense-in-depth).
+		AssertIsLessIf(api, inputActive[i], c.Priv.InputNoteTreeNumber[i], uint64(MaxNoteTreeNumber)+1, NoteTreeNumberBits+1)
+
+		// Canonical zero padding for inactive inputs.
+		AssertIsZeroIf(api, inputInactive, c.Priv.InputNoteTreeNumber[i])
+		AssertIsZeroIf(api, inputInactive, c.Priv.InputValue[i])
+		AssertIsZeroIf(api, inputInactive, c.Priv.InputNoteRnd[i])
+		AssertIsZeroIf(api, inputInactive, c.Priv.InputNoteLeafIndex[i])
+		AssertIsZeroIf(api, inputInactive, c.Pub.Nullifiers[i])
+		AssertIsZeroIf(api, inputInactive, c.Pub.InputCommitments[i])
+		for d := 0; d < c.Shape.MerkleDepth; d++ {
+			AssertIsZeroIf(api, inputInactive, c.Priv.InputNotePath[i][d])
+		}
 	}
-	return forcedWithdrawInternalState{inputActive: inputActive}
+	return forcedWithdrawInternalState{inputActive: inputActive, legacyFormat: isNonZero(api, c.Pub.LegacyTokenId)}
 }
 
 // =============================================================================
@@ -263,34 +323,20 @@ func (c *ForcedWithdrawCircuit) processInputs(api frontend.API, state forcedWith
 	// Compute MPK = Hash(domainMPK, accountId, nullifyingKey) once for all inputs.
 	masterPublicKey := Poseidon2T4(api, domainMPK, c.Pub.SpenderAccountId, c.Priv.NullifyingKey)
 
+	// Resolve the note format once, outside the loop. Both relations share this circuit's NPK derivation and
+	// differ only in the commitment domain, the asset the commitment hashes, and the nullifier domain. A
+	// per-input selector would let one proof span both asset namespaces while the payout stays a single
+	// ERC-20 amount, so the selection is proof-wide by construction rather than by convention.
+	commitmentDomain := Select(api, state.legacyFormat, domainNoteCommitment, domainNoteCommitmentV2)
+	commitmentAsset := Select(api, state.legacyFormat, c.Pub.LegacyTokenId, c.Pub.WithdrawalTokenAddress)
+	nullifierDomain := Select(api, state.legacyFormat, domainNullifier, domainNullifierV2)
+
 	inputValueSum := frontend.Variable(0)
 	for i := 0; i < c.Shape.MaxInputs; i++ {
 		inputActive := state.inputActive[i]
-		inputInactive := Not(api, inputActive)
 
-		// Zero padding for inactive inputs (B: enforce inactive semantics).
-		AssertIsZeroIf(api, inputInactive, c.Priv.InputNoteTreeNumber[i])
-		AssertIsZeroIf(api, inputInactive, c.Priv.InputTokenID[i])
-		AssertIsZeroIf(api, inputInactive, c.Priv.InputValue[i])
-		AssertIsZeroIf(api, inputInactive, c.Priv.InputNoteRnd[i])
-		AssertIsZeroIf(api, inputInactive, c.Priv.InputNoteLeafIndex[i])
-		AssertIsZeroIf(api, inputInactive, c.Pub.Nullifiers[i])
-		AssertIsZeroIf(api, inputInactive, c.Pub.InputCommitments[i])
-		for d := 0; d < c.Shape.MerkleDepth; d++ {
-			AssertIsZeroIf(api, inputInactive, c.Priv.InputNotePath[i][d])
-		}
-
-		AssertIsNBits(api, c.Priv.InputValue[i], AmountBits)
-		AssertIsNBits(api, c.Priv.InputTokenID[i], TokenIDBits)
-
-		// Bounds check for input note tree number (defense-in-depth).
-		AssertIsLessIf(api, inputActive, c.Priv.InputNoteTreeNumber[i], uint64(MaxNoteTreeNumber)+1, NoteTreeNumberBits+1)
-
-		// All active inputs must be for the same token id.
-		AssertEqualIf(api, inputActive, c.Priv.InputTokenID[i], c.Priv.TransferTokenID)
-
-		// Compute input NPK = Hash(domainNote, MPK, noteRnd).
-		inputNPK := Poseidon2T4(api, domainNote, masterPublicKey, c.Priv.InputNoteRnd[i])
+		// Compute input NPK = Hash(domainNotePublicKey, MPK, noteRnd).
+		inputNPK := Poseidon2T4(api, domainNotePublicKey, masterPublicKey, c.Priv.InputNoteRnd[i])
 
 		// Refuse the reserved low range. A withdrawal marker is a note commitment whose key slot
 		// holds a 160-bit recipient address, and the input key below is a Poseidon output, so
@@ -299,8 +345,8 @@ func (c *ForcedWithdrawCircuit) processInputs(api frontend.API, state forcedWith
 		// and already-paid-out value.
 		AssertSpendableNPKIf(api, inputActive, inputNPK)
 
-		// Compute input commitment = Hash(domainNote, NPK, tokenId, value) and bind to public InputCommitments.
-		commitment := Poseidon2T4(api, domainNote, inputNPK, c.Priv.InputTokenID[i], c.Priv.InputValue[i])
+		// Bind each input commitment to the proof's selected asset.
+		commitment := Poseidon2T4(api, commitmentDomain, inputNPK, commitmentAsset, c.Priv.InputValue[i])
 		AssertIsNonZeroIf(api, inputActive, commitment)
 		AssertEqualIf(api, inputActive, commitment, c.Pub.InputCommitments[i])
 
@@ -310,7 +356,7 @@ func (c *ForcedWithdrawCircuit) processInputs(api frontend.API, state forcedWith
 		AssertRootWithTreeNumberIf(api, inputActive, rootComputed, c.Priv.InputNoteTreeNumber[i], c.Pub.NoteKnownRoots, c.Pub.NoteKnownTreeNumbersPacked)
 
 		// Bind the public nullifier.
-		combinedDomain := api.Add(domainNullifier, api.Mul(c.Priv.InputNoteTreeNumber[i], NullifierTreeNumberMultiplier))
+		combinedDomain := api.Add(nullifierDomain, api.Mul(c.Priv.InputNoteTreeNumber[i], NullifierTreeNumberMultiplier))
 		nullifier := Poseidon2T4(api, combinedDomain, c.Priv.NullifyingKey, c.Priv.InputNoteLeafIndex[i])
 		AssertEqualIf(api, inputActive, nullifier, c.Pub.Nullifiers[i])
 
@@ -318,9 +364,4 @@ func (c *ForcedWithdrawCircuit) processInputs(api frontend.API, state forcedWith
 		inputValueSum = AddIf(api, inputActive, inputValueSum, c.Priv.InputValue[i])
 	}
 	return inputValueSum
-}
-
-func (c *ForcedWithdrawCircuit) assertFinalState(api frontend.API, inputValueSum frontend.Variable) {
-	AssertEqual(api, c.Priv.TransferTokenID, c.Pub.WithdrawalTokenID)
-	AssertEqual(api, c.Pub.WithdrawalAmount, inputValueSum)
 }

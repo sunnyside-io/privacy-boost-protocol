@@ -12,6 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Sunnyside Labs Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package frontend
 
 import (
@@ -44,14 +58,15 @@ import (
 //     registered H ties the credited note to the account that registered the
 //     portal — crediting any other account would require a Poseidon second
 //     preimage (the crediting-integrity invariant).
-//   - **Note derivation**: noteRnd = Poseidon(D_PNOTE, blind_WITNESS, E_PUB, counter_PUB);
-//     NPK = Poseidon(D_NOTE, recipientMPK, noteRnd) — the SAME recipientMPK witness that
+//   - **Note derivation**: scope = Poseidon(domainPortalScopeV2, chainID, poolAddress, E_PUB)
+//     noteRnd = Poseidon(domainPortalNoteV2, blind_WITNESS, scope, counter_PUB);
+//     NPK = Poseidon(domainNotePublicKey, recipientMPK, noteRnd) — the SAME recipientMPK witness that
 //     opened H also builds NPK, which is the hinge that makes the proof
 //     satisfiable only when the bound account is the credited account. noteRnd binds
 //     the SECRET blind so the leaf is unlinkable on-chain, and public E so two
 //     portals sharing a blind cannot collide — see "Recipient hiding" below.
-//   - **Commitment correctness**: commitment_PUB == Poseidon(D_NOTE, NPK,
-//     tokenId, amount), where amount is the net credited value supplied by the
+//   - **Commitment correctness**: commitment_PUB == Poseidon(domainNoteCommitmentV2, NPK,
+//     tokenAddress, amount), where amount is the net credited value supplied by the
 //     contract from the stored record.
 //   - **Tree update**: all active commitments are appended to the active tree
 //     (with optional rollover) and the resulting (RootNew, CountNew) matches the
@@ -77,16 +92,10 @@ import (
 //     attacker cannot exploit this: opening another owner's H to a chosen
 //     recipientMPK' is a second-preimage break, and even a self-chosen recipientMPK only
 //     credits that same opaque value's notes, never lets the prover spend them
-//     (spending still needs the secret nullifyingKey and an EdDSA signature).
-//   - It does NOT bind ChainId/PoolAddress in-circuit. Unlike DepositEpochCircuit
-//     — which folds them into a computedRequestId (in deposit_epoch_circuit.go)
-//     because the depositor supplies commitments at request time — the portal
-//     path's chain/pool domain separation is enforced ON-CHAIN: the contract keys
-//     each pending record by portalDepositId = keccak256(abi.encode(D_PORTAL_REQUEST,
-//     chainId, pool, ...)) and feeds every public input from that record. These
-//     two inputs ride in the public vector purely for layout parity with the
-//     on-chain verifier; a reviewer must not assume the epoch circuit's request-id
-//     binding exists here (it intentionally does not — see the struct doc).
+//     (spending still needs the secret nullifyingKey and valid key or spend-approval authorization).
+//   - ChainId and PoolAddress bind each active note's randomness through the
+//     deployment scope. The contract additionally domain-separates pending request
+//     IDs and supplies their stored public data to the verifier.
 //
 // Witness author notes:
 //   - Arrays are fixed-size. Only the first `Pub.NRequests` entries are active;
@@ -110,26 +119,16 @@ type DepositPortalShape struct {
 	MaxNoteRootsPerProof int // number of note roots provided in a proof
 }
 
+// Exported field spelling is frozen for witness-builder compatibility. New identifiers use Go initialisms.
 type DepositPortalPublicInputs struct {
 	// Tree state — identical shape to the deposit-epoch circuit so the portal
 	// epoch can append to the SAME shared note tree under the same CAS rules.
 	//
-	// ChainId/PoolAddress are present for public-input-layout PARITY with the
-	// on-chain verifier (buildPortalDepositInputs emits them in slots 0/1, the
-	// same positions buildDepositInputs uses), NOT to bind them in-circuit. The
-	// chain/pool domain separation lives ON-CHAIN: the contract keys each pending
-	// record by portalDepositId = keccak256(abi.encode(D_PORTAL_REQUEST, chainId,
-	// pool, E, tokenId, amount, counter, H)), loads the record by that key, and
-	// supplies every public input — including these two — from storage. The
-	// circuit is therefore only ever fed the honest contract's chain/pool values;
-	// a proof built for one (chain, pool) is not transferable to another because
-	// no other contract holds the matching record. Deliberately unconstrained
-	// here so the audited circuit stays minimal (it opens H against the opaque
-	// recipientMPK witness and nothing more); the layout/no-op is locked by
-	// TestDepositPortalCircuit_PublicInputLayout and the WrongChainId/WrongPool
-	// tamper tests.
-	ChainId                    frontend.Variable   `gnark:",public"` // chain id — contract-pinned for layout parity; not circuit-constrained (see struct doc)
-	PoolAddress                frontend.Variable   `gnark:",public"` // pool address — contract-pinned for layout parity; not circuit-constrained (see struct doc)
+	// ChainId and PoolAddress constrain each active note through its deployment
+	// scope. The pool also validates its funded pending record and tree transition.
+	// The pending-record identifier itself is not a circuit public input.
+	ChainId                    frontend.Variable   `gnark:",public"` // chain id — bound into active portal note randomness
+	PoolAddress                frontend.Variable   `gnark:",public"` // pool address — bound into active portal note randomness
 	NoteKnownRoots             []frontend.Variable `gnark:",public"` // [MaxNoteRootsPerProof] historical note commitment tree roots
 	NoteKnownTreeNumbersPacked frontend.Variable   `gnark:",public"` // packed tree numbers (15 bits each)
 	ActiveNoteTreeNumber       frontend.Variable   `gnark:",public"` // selects which NoteKnownRoots is the active output tree
@@ -143,15 +142,16 @@ type DepositPortalPublicInputs struct {
 	NRequests frontend.Variable `gnark:",public"` // number of active portal deposits
 
 	// Per-deposit public arrays (active first, then zero padded). The on-chain
-	// `buildPortalDepositInputs` lays these out as {E, counter, H, tokenId, amount, commitment}.
-	PortalAddresses []frontend.Variable `gnark:",public"` // [MaxSlots] E — public; on active slots E feeds noteRnd (so two portals sharing a blind yield distinct commitments), padding slots are unconstrained
+	// `buildPortalDepositInputs` lays these out as {E, counter, H, tokenAddress, amount, commitment}.
+	PortalAddresses []frontend.Variable `gnark:",public"` // [MaxSlots] E — active addresses feed noteRnd; inactive slots must be zero
 	Counters        []frontend.Variable `gnark:",public"` // [MaxSlots] per-portal sweep counter (feeds noteRnd → note uniqueness)
 	RecipientBindHs []frontend.Variable `gnark:",public"` // [MaxSlots] H — the registered owner binding, read on-chain from E's portalBinding()
-	TokenIDs        []frontend.Variable `gnark:",public"` // [MaxSlots] token id of the swept balance
+	TokenAddresses  []frontend.Variable `gnark:",public"` // [MaxSlots] token address of the swept balance
 	Amounts         []frontend.Variable `gnark:",public"` // [MaxSlots] net credited amount (gross − fee), supplied by the contract from storage
 	CommitmentsOut  []frontend.Variable `gnark:",public"` // [MaxSlots] note leaf appended to the tree
 }
 
+// Exported field spelling is frozen for witness-builder compatibility. New identifiers use Go initialisms.
 type DepositPortalPrivateInputs struct {
 	// Per-deposit witness (active first, then zero padded). These are the ONLY
 	// owner-identifying values, and they never appear in the public witness, so
@@ -194,7 +194,7 @@ func NewDepositPortalCircuit(maxSlots, merkleDepth, maxNoteRootsPerProof int) *D
 			PortalAddresses: make([]frontend.Variable, maxSlots),
 			Counters:        make([]frontend.Variable, maxSlots),
 			RecipientBindHs: make([]frontend.Variable, maxSlots),
-			TokenIDs:        make([]frontend.Variable, maxSlots),
+			TokenAddresses:  make([]frontend.Variable, maxSlots),
 			Amounts:         make([]frontend.Variable, maxSlots),
 			CommitmentsOut:  make([]frontend.Variable, maxSlots),
 		},
@@ -214,12 +214,6 @@ func NewDepositPortalCircuit(maxSlots, merkleDepth, maxNoteRootsPerProof int) *D
 func (c *DepositPortalCircuit) Define(api frontend.API) error {
 	// Build sizing-dependent selectors and validate public tree inputs / rollover.
 	state := c.validateInputs(api)
-
-	// Range-check all per-deposit net amounts (prevents overflow when appended and
-	// keeps the credited value within the contract's uint96 amount type).
-	for i := 0; i < c.Shape.MaxSlots; i++ {
-		AssertIsNBits(api, c.Pub.Amounts[i], AmountBits)
-	}
 
 	// Bind each deposit to its owner H and derive its note.
 	c.processDeposits(api, &state)
@@ -245,6 +239,32 @@ func (c *DepositPortalCircuit) validateInputs(api frontend.API) portalInternalSt
 	depositActive := make([]Bool, c.Shape.MaxSlots)
 	for i := 0; i < c.Shape.MaxSlots; i++ {
 		depositActive[i] = isGreaterThanConst(api, c.Pub.NRequests, uint64(i), CountBits)
+		depositInactive := Not(api, depositActive[i])
+
+		// Match the native record's ERC-20/portal addresses and uint64 sweep counter.
+		AssertIsNBits(api, c.Pub.TokenAddresses[i], AddressBits)
+		AssertIsNonZeroIf(api, depositActive[i], c.Pub.TokenAddresses[i])
+		AssertIsNBits(api, c.Pub.PortalAddresses[i], AddressBits)
+		AssertIsNBits(api, c.Pub.Counters[i], PortalCounterBits)
+
+		// Per-deposit net amounts, range-checked so an appended note stays within
+		// the contract's uint96 amount type.
+		AssertIsNBits(api, c.Pub.Amounts[i], AmountBits)
+
+		// Canonical zero padding covers every per-slot public and private field,
+		// including the portal address. Only active slots contribute an appended note.
+		AssertIsZeroIf(api, depositInactive, c.Pub.PortalAddresses[i])
+		AssertIsZeroIf(api, depositInactive, c.Pub.Counters[i])
+		AssertIsZeroIf(api, depositInactive, c.Pub.RecipientBindHs[i])
+		AssertIsZeroIf(api, depositInactive, c.Pub.TokenAddresses[i])
+		AssertIsZeroIf(api, depositInactive, c.Pub.Amounts[i])
+		AssertIsZeroIf(api, depositInactive, c.Pub.CommitmentsOut[i])
+		AssertIsZeroIf(api, depositInactive, c.Priv.RecipientMPKs[i])
+		AssertIsZeroIf(api, depositInactive, c.Priv.Blinds[i])
+
+		// Active deposits must credit a positive amount: a zero-value leaf would
+		// consume tree capacity while crediting nothing.
+		AssertIsNonZeroIf(api, depositActive[i], c.Pub.Amounts[i])
 	}
 
 	return portalInternalState{
@@ -257,8 +277,8 @@ func (c *DepositPortalCircuit) validateInputs(api frontend.API) portalInternalSt
 // validatePublicInputsAndInitTreeState enforces public bounds, rollover semantics, and binds the
 // provided `NoteFrontierOld` witness to the selected active tree root (when not rolling over).
 //
-// This mirrors DepositEpochCircuit.validatePublicInputsAndInitTreeState exactly so the portal epoch
-// shares the same tree-state validation as the deposit/transfer epochs that append to the same tree.
+// This mirrors NoteAppend.validateAndInitTreeState with the portal circuit's own shape
+// and request bounds, sharing the tree-state rules used by the other append circuits.
 func (c *DepositPortalCircuit) validatePublicInputsAndInitTreeState(api frontend.API) (currentCount frontend.Variable, currentFrontier []frontend.Variable) {
 	// Range-check tree counters.
 	AssertIsNBits(api, c.Pub.CountOld, CountBits)
@@ -325,22 +345,6 @@ func (c *DepositPortalCircuit) validatePublicInputsAndInitTreeState(api frontend
 func (c *DepositPortalCircuit) processDeposits(api frontend.API, state *portalInternalState) {
 	for i := 0; i < c.Shape.MaxSlots; i++ {
 		depositActive := state.depositActive[i]
-		depositInactive := Not(api, depositActive)
-
-		// Zero padding for inactive slots: every public and witness field of a padded
-		// slot must be zero so a prover cannot smuggle an extra note past NRequests.
-		AssertIsZeroIf(api, depositInactive, c.Pub.PortalAddresses[i])
-		AssertIsZeroIf(api, depositInactive, c.Pub.Counters[i])
-		AssertIsZeroIf(api, depositInactive, c.Pub.RecipientBindHs[i])
-		AssertIsZeroIf(api, depositInactive, c.Pub.TokenIDs[i])
-		AssertIsZeroIf(api, depositInactive, c.Pub.Amounts[i])
-		AssertIsZeroIf(api, depositInactive, c.Pub.CommitmentsOut[i])
-		AssertIsZeroIf(api, depositInactive, c.Priv.RecipientMPKs[i])
-		AssertIsZeroIf(api, depositInactive, c.Priv.Blinds[i])
-
-		// Active deposits must credit a positive amount: a zero-value leaf would
-		// consume tree capacity while crediting nothing.
-		AssertIsNonZeroIf(api, depositActive, c.Pub.Amounts[i])
 
 		// (1) Open the registered owner binding H against the opaque (recipientMPK, blind)
 		// witness. This is the crediting-integrity check: only the account whose
@@ -349,27 +353,21 @@ func (c *DepositPortalCircuit) processDeposits(api frontend.API, state *portalIn
 		expectedH := Poseidon2T4(api, domainPortalBind, c.Priv.RecipientMPKs[i], c.Priv.Blinds[i])
 		AssertEqualIf(api, depositActive, expectedH, c.Pub.RecipientBindHs[i])
 
-		// (2) Derive the note randomness from the SECRET blind witness, the public portal
-		// address E, and the public counter: noteRnd = Poseidon(D_PNOTE, blind, E, counter).
-		// blind keeps the credit unlinkable — every other commitment input is public, so a
-		// blind-free noteRnd would let anyone holding the recipient's (widely-shared) MPK
-		// recompute the leaf and link it to the account; blind is known only to the owner and
-		// the discovery registry, so the leaf stays recomputable by the registry-holding
-		// indexer but not by an on-chain observer. Binding the public E makes the leaf unique
-		// per portal: the circuit does not assume blind differs between a recipient's portals
-		// (nothing forces it to), so two portals sharing a blind would — without E in the
-		// preimage — produce a colliding commitment on equal-(counter, token, amount) sweeps,
-		// leaving the second note unspendable. E is unique per portal by construction.
-		noteRnd := Poseidon2T4(api, domainPortalNote, c.Priv.Blinds[i], c.Pub.PortalAddresses[i], c.Pub.Counters[i])
+		// (2) Bind randomness to the chain, pool, portal, and sweep counter. Reusing
+		// the same binding and blind on another deployment must yield a different
+		// note key, so disclosure of one deployment's randomness cannot identify
+		// the corresponding sweep on another deployment.
+		scope := Poseidon2T4(api, domainPortalScopeV2, c.Pub.ChainId, c.Pub.PoolAddress, c.Pub.PortalAddresses[i])
+		noteRnd := Poseidon2T4(api, domainPortalNoteV2, c.Priv.Blinds[i], scope, c.Pub.Counters[i])
 
 		// (3) The SAME recipientMPK that opened H builds the NPK — this is the hinge that
 		// ties the registered binding to the credited note. NPK still hides recipientMPK.
-		npk := Poseidon2T4(api, domainNote, c.Priv.RecipientMPKs[i], noteRnd)
+		npk := Poseidon2T4(api, domainNotePublicKey, c.Priv.RecipientMPKs[i], noteRnd)
 
 		// (4) The commitment binds NPK, token, and the net credited amount. The amount
 		// is supplied by the contract from the stored record, so a relay cannot
 		// substitute a different credited value here.
-		expectedCommitment := Poseidon2T4(api, domainNote, npk, c.Pub.TokenIDs[i], c.Pub.Amounts[i])
+		expectedCommitment := Poseidon2T4(api, domainNoteCommitmentV2, npk, c.Pub.TokenAddresses[i], c.Pub.Amounts[i])
 		AssertEqualIf(api, depositActive, expectedCommitment, c.Pub.CommitmentsOut[i])
 		AssertIsNonZeroIf(api, depositActive, c.Pub.CommitmentsOut[i])
 
@@ -402,7 +400,7 @@ func (c *DepositPortalCircuit) applyBatchAppend(api frontend.API, state *portalI
 
 // assertFinalState binds the internal working tree state to public outputs.
 //
-// Identical to DepositEpochCircuit.assertFinalState: when the tree fills,
+// Like NoteAppend.assertFinalState, using the portal circuit's own shape and state: when the tree fills,
 // computeRootFromFrontier returns an incorrect value, so the full-tree carry from the batch
 // append is used instead.
 func (c *DepositPortalCircuit) assertFinalState(api frontend.API, state portalInternalState) {
@@ -437,7 +435,7 @@ func (c *DepositPortalCircuit) assertFinalState(api frontend.API, state portalIn
 //	  portalAddresses[0..maxSlots-1],   // E
 //	  counters[0..maxSlots-1],
 //	  recipientBindHs[0..maxSlots-1],       // H, read on-chain from E's portalBinding()
-//	  tokenIds[0..maxSlots-1],
+//	  tokenAddresses[0..maxSlots-1],
 //	  amounts[0..maxSlots-1],           // net credited (gross - fee)
 //	  commitmentsOut[0..maxSlots-1] ]
 //
@@ -452,12 +450,13 @@ func (c *DepositPortalCircuit) assertFinalState(api frontend.API, state portalIn
 //
 // recipientMPK / blind are witness-only and therefore deliberately absent from this
 // vector (recipient hiding).
+// Exported field spelling is frozen for witness-builder compatibility. New identifiers use Go initialisms.
 type PortalDepositPublicInputs struct {
-	ChainID                    *big.Int   // chain id (layout slot 0; not circuit-constrained — see struct doc)
-	PoolAddress                *big.Int   // pool address (layout slot 1; not circuit-constrained)
+	ChainID                    *big.Int   // chain id (layout slot 0, bound into portal scope)
+	PoolAddress                *big.Int   // pool address (layout slot 1, bound into portal scope)
 	NoteKnownRoots             []*big.Int // [maxNoteRoots] historical note-tree roots
 	NoteKnownTreeNumbersPacked *big.Int   // packed tree numbers (15 bits each)
-	ActiveNoteTreeNumber       *big.Int   // index of the active output tree within NoteKnownRoots
+	ActiveNoteTreeNumber       *big.Int   // global tree number selecting the active output root, not an array index
 	CountOld                   *big.Int   // old leaf count of the active tree
 	RootNew                    *big.Int   // root after appending all active commitments
 	CountNew                   *big.Int   // new leaf count after appends
@@ -468,7 +467,7 @@ type PortalDepositPublicInputs struct {
 	PortalAddresses []*big.Int // E
 	Counters        []*big.Int // per-portal sweep counter
 	RecipientBindHs []*big.Int // H
-	TokenIDs        []*big.Int // token id
+	TokenAddresses  []*big.Int // token address
 	Amounts         []*big.Int // net credited amount
 	CommitmentsOut  []*big.Int // appended note leaf
 }
@@ -493,7 +492,7 @@ func BuildPortalDepositInputs(in PortalDepositPublicInputs, maxNoteRoots, maxSlo
 		{"PortalAddresses", in.PortalAddresses},
 		{"Counters", in.Counters},
 		{"RecipientBindHs", in.RecipientBindHs},
-		{"TokenIDs", in.TokenIDs},
+		{"TokenAddresses", in.TokenAddresses},
 		{"Amounts", in.Amounts},
 		{"CommitmentsOut", in.CommitmentsOut},
 	} {
@@ -508,9 +507,11 @@ func BuildPortalDepositInputs(in PortalDepositPublicInputs, maxNoteRoots, maxSlo
 	// for the normal deposit minus the dropped nTotalCommitments field.
 	out := make([]*big.Int, 0, 2+maxNoteRoots+1+6+maxSlots*6)
 
-	// Scalar prefix — same order and positions as the deposit epoch's
-	// buildDepositInputs (chainId/pool at 0/1, then packed roots, then the
-	// scalar tree-state block) so the shared note tree's CAS lines up.
+	// Scalar prefix — chainId/pool at 0/1 and the packed roots next, the same
+	// positions buildDepositInputs uses. The tree-state block below is this
+	// circuit's own declaration order and is NOT shared with deposit, which
+	// embeds NoteAppend and therefore emits rootNew before countOld. Both trees
+	// are still the same note tree; only the two public vectors differ.
 	out = append(out, in.ChainID, in.PoolAddress)
 	out = append(out, in.NoteKnownRoots...)
 	out = append(out,
@@ -530,7 +531,7 @@ func BuildPortalDepositInputs(in PortalDepositPublicInputs, maxNoteRoots, maxSlo
 	out = append(out, in.PortalAddresses...)
 	out = append(out, in.Counters...)
 	out = append(out, in.RecipientBindHs...)
-	out = append(out, in.TokenIDs...)
+	out = append(out, in.TokenAddresses...)
 	out = append(out, in.Amounts...)
 	out = append(out, in.CommitmentsOut...)
 

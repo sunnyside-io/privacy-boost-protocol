@@ -12,6 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Sunnyside Labs Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package frontend
 
 import (
@@ -22,15 +36,17 @@ import (
 // Spendable note public key range
 // =============================================================================
 //
-// A withdrawal marker is Poseidon(domainNote, uint160(to), tokenId, amount): the same hash, the
-// same domain, and the same field ordering an ordinary note commitment uses, with the recipient
-// address sitting where a note public key would sit. Anything that can prove knowledge of a note
-// opening for a marker can therefore spend value the pool has already paid out publicly.
+// Legacy withdrawal markers are Poseidon(domainNoteCommitment, uint160(to), tokenID, amount).
+// Native payout markers use domainNoteCommitmentV2 and tokenAddress instead. Within each
+// protocol the marker has the same domain and field order as a note commitment,
+// with a recipient address in the NPK position. Opening an appended marker as a
+// note would therefore spend value the pool has already paid out publicly.
 //
 // The separation enforced here is a range, not a new domain: a spendable note public key must lie
 // at or above 2^ReservedNPKBits, which is exactly the range an address-shaped marker key can never
-// reach. Keeping the marker formula untouched preserves every deployed root, every signed
-// withdrawal request, and the contract's marker equality checks.
+// reach. Native payouts retain this key separation even though their markers are
+// public proof outputs only and are never appended to the note tree. NoteMigration
+// applies the same range check before opening a legacy commitment.
 //
 // The residual assumption is that no honest note public key lands in the reserved range. NPKs are
 // Poseidon outputs, so that happens with probability near 2^-94 per note. That is not an
@@ -46,7 +62,7 @@ import (
 //
 // Every creation site where a caller rather than the circuit chooses the key refuses it too, so a
 // recipient cannot be handed a commitment no spend relation will open. The epoch fee key is a
-// public input the operator chooses, refused once per batch in processFeeCommitments. Epoch
+// private witness the operator chooses, refused once per batch in processFeeCommitments. Epoch
 // transfer outputs are chosen by the sender for the recipient, refused per slot in
 // assertOutputNotes. Deposit credits are chosen by the depositor, refused per slot in
 // processCommitments. The gateway receipt key arrives in calldata, refused on chain in LibGateway
@@ -54,8 +70,8 @@ import (
 //
 // Two sites remain unrefused, both because the key cannot reach the range rather than because the
 // check is unaffordable. The portal credit hashes it in-circuit as
-// Poseidon(domainNote, recipientMPK, noteRnd), and the gift-claim mint hashes it as
-// Poseidon(domainNote, mintMPK, outputNoteRnd). No witness places a Poseidon output below 2^160
+// Poseidon(domainNotePublicKey, recipientMPK, noteRnd), and the gift-claim mint hashes it as
+// Poseidon(domainNotePublicKey, mintMPK, outputNoteRnd). No witness places a Poseidon output below 2^160
 // without a preimage break, so a range check there constrains nothing an adversary controls.
 //
 // One slot is exempt for a third reason, and a reader must not generalise from it: output zero of
