@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-pragma solidity 0.8.34;
+pragma solidity ^0.8.34;
 
 /// @title Poseidon2T4 (BN254 scalar field)
 /// @notice Poseidon2 permutation with t=4, d=5, rounds_f=8, rounds_p=56
