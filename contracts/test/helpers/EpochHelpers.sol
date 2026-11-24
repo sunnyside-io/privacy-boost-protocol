@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-pragma solidity 0.8.34;
+pragma solidity ^0.8.34;
 
 import {Output, Transfer, EpochTreeState, TreeRootPair, Withdrawal, GatewaySlot} from "src/interfaces/IStructs.sol";
 import {IPrivacyBoost} from "src/interfaces/IPrivacyBoost.sol";

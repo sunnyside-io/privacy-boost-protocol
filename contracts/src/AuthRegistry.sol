@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-pragma solidity 0.8.34;
+pragma solidity ^0.8.34;
 
 import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import {EIP7702Utils} from "@openzeppelin/contracts/account/utils/EIP7702Utils.sol";

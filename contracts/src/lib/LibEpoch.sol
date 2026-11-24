@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-pragma solidity 0.8.34;
+pragma solidity ^0.8.34;
 
 import {MAX_AUTH_ROOTS_PER_PROOF, MAX_NOTE_ROOTS_PER_PROOF, ROOT_HISTORY_SIZE} from "src/interfaces/Constants.sol";
 import {Transfer, Withdrawal, EpochTreeState, TreeRootPair, GatewaySlot} from "src/interfaces/IStructs.sol";

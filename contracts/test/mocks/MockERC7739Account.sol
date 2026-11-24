@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.34;
+pragma solidity ^0.8.34;
 
 /// @notice Test fixture for the ERC-7739 ("defensive rehashing") signature
 ///         path. Mimics the Solady-derived generic-wrap pattern used by
