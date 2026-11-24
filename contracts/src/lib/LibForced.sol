@@ -3,7 +3,7 @@
  * Copyright (c) 2026 Sunnyside Labs Inc.
  * Licensed under the Apache License, Version 2.0.
  */
-pragma solidity 0.8.34;
+pragma solidity ^0.8.34;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";

@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-pragma solidity 0.8.34;
+pragma solidity ^0.8.34;
 
 /// @title ITokenRegistry
 /// @notice Interface for append-only registry for compact token IDs (uint16)

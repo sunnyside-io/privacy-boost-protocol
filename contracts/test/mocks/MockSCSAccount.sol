@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.34;
+pragma solidity ^0.8.34;
 
 /// @notice Test fixture mimicking the on-chain wire format that Startale SCS
 ///         Account on Soneium emits for ERC-1271 signatures:
